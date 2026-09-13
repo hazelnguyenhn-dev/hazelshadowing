@@ -138,7 +138,7 @@ def parse_keys(raw: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # TRANSCRIPT PARSER
 # ---------------------------------------------------------------------------
-TS_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?::(\d{2}))?(?:[.,](\d{1,3}))?\]")
+TS_RE = re.compile(r"(?:\[)?(\d{1,2}):(\d{2})(?::(\d{2}))?(?:[.,](\d{1,3}))?(?:\])?")
 
 
 def _ts_to_sec(m: re.Match) -> float:
@@ -158,6 +158,7 @@ def parse_transcript(raw: str) -> list[dict]:
     if not tokens:
         return []
 
+    # fragment = (start_sec, next_start_or_None, text)
     frags = []
     for i, m in enumerate(tokens):
         start = _ts_to_sec(m)
@@ -165,32 +166,35 @@ def parse_transcript(raw: str) -> list[dict]:
         t_end = tokens[i + 1].start() if i + 1 < len(tokens) else len(raw)
         txt = re.sub(r"\s+", " ", raw[t_start:t_end].strip().replace("\n", " "))
         if txt:
-            frags.append((start, txt))
+            nxt = _ts_to_sec(tokens[i + 1]) if i + 1 < len(tokens) else None
+            frags.append((start, nxt, txt))
 
+    # NỘI SUY: rải mốc thời gian cho từng từ trong 1 đoạn (đoạn nhiều câu / nhiều từ
+    # dùng chung 1 mốc -> chia đều theo vị trí từ giữa mốc này và mốc kế).
     words = []
-    for start, txt in frags:
-        for w in txt.split():
-            words.append((start, w))
+    for start, nxt, txt in frags:
+        ws = txt.split()
+        n = len(ws)
+        end = nxt if nxt is not None else start + max(DEFAULT_TAIL_SEC, n * 0.35)
+        span = max(0.0, end - start)
+        for j, w in enumerate(ws):
+            words.append((start + (span * j / n if n else 0.0), w))
 
     sentences, buf, buf_start = [], [], None
-    for idx, (start, w) in enumerate(words):
+    for i, (t, w) in enumerate(words):
         if not buf:
-            buf_start = start
+            buf_start = t
         buf.append(w)
         if re.search(r"[.!?][\"')\]]*$", w):
-            nxt = words[idx + 1][0] if idx + 1 < len(words) else None
-            end = nxt if nxt is not None else start + DEFAULT_TAIL_SEC
-            est = max(1.5, len(buf) * 0.35)
-            if end - buf_start < est:
-                end = buf_start + est
+            end = words[i + 1][0] if i + 1 < len(words) else t + max(1.5, len(buf) * 0.35)
+            if end - buf_start < 1.0:
+                end = buf_start + max(1.5, len(buf) * 0.35)
             sentences.append({"text": " ".join(buf).strip(),
                               "start": round(buf_start, 2), "end": round(end, 2)})
             buf = []
-
     if buf:
-        est = max(1.5, len(buf) * 0.35)
-        sentences.append({"text": " ".join(buf).strip(),
-                          "start": round(buf_start, 2), "end": round(buf_start + est, 2)})
+        sentences.append({"text": " ".join(buf).strip(), "start": round(buf_start, 2),
+                          "end": round(buf_start + max(1.5, len(buf) * 0.35), 2)})
 
     for i, s in enumerate(sentences):
         s["sentence_id"] = i
@@ -515,23 +519,29 @@ def record_listen(student_id, lesson_id, sentence_id):
     }).eq("id", rec["id"]).execute()
 
 
-def record_practice(student_id, lesson_id, sentence_id, seconds, match):
-    """Ghi 1 lần LUYỆN hợp lệ (miễn phí, không chấm). Tăng practice_count + log."""
+def record_practice(student_id, lesson_id, sentence_id, seconds, match, heard, wav_bytes):
+    """Ghi 1 lần đọc hợp lệ: tăng practice_count, log (kèm máy-nghe-được),
+    và tự lưu audio nếu đây là lần KHỚP CAO NHẤT."""
     now = datetime.now(timezone.utc).isoformat()
-    entry = {"t": now, "sec": round(seconds, 1), "match": round(match, 2)}
+    entry = {"t": now, "sec": round(seconds, 1), "match": round(match, 2),
+             "heard": (heard or "")[:200]}
+    best_pct = round(match * 100)
     rec = get_record(student_id, lesson_id, sentence_id)
     if rec is None:
+        best_url = upload_audio(student_id, lesson_id, sentence_id, "best", wav_bytes)
         sb.table("assistantapp_shadowing_records").insert({
             "student_id": student_id, "lesson_id": lesson_id, "sentence_id": sentence_id,
             "total_attempts": 0, "practice_count": 1, "practice_log": [entry],
-            "last_updated": now,
+            "best_score": best_pct, "best_audio_url": best_url, "last_updated": now,
         }).execute()
         return
     log = (rec.get("practice_log") or [])[-19:] + [entry]      # giữ 20 mục gần nhất
-    sb.table("assistantapp_shadowing_records").update({
-        "practice_count": (rec.get("practice_count") or 0) + 1,
-        "practice_log": log, "last_updated": now,
-    }).eq("id", rec["id"]).execute()
+    upd = {"practice_count": (rec.get("practice_count") or 0) + 1,
+           "practice_log": log, "last_updated": now}
+    if rec.get("best_score") is None or best_pct > rec["best_score"]:
+        upd["best_score"] = best_pct
+        upd["best_audio_url"] = upload_audio(student_id, lesson_id, sentence_id, "best", wav_bytes)
+    sb.table("assistantapp_shadowing_records").update(upd).eq("id", rec["id"]).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +739,20 @@ def render_connected_speech(m: dict) -> str:
     return "🔗 " + "  ·  ".join(_cs_item(c) for c in cs)
 
 
+def render_syllable_guide(m: dict) -> str:
+    """Chuỗi trọng âm âm tiết để DẠY (chữ IN HOA = âm cần nhấn), vd im‑PRES‑sion."""
+    syl = m.get("syllable_stress") or []
+    items = []
+    for w in syl:
+        sylls = w.get("syllables") or []
+        idx = w.get("stress_idx", 0)
+        if not sylls:
+            continue
+        parts = [f"**{t.upper()}**" if i == idx else t.lower() for i, t in enumerate(sylls)]
+        items.append("‑".join(parts))
+    return " · ".join(items)
+
+
 def highlight_issue_words(text: str, words: list[str]) -> str:
     out = text
     for w in words:
@@ -797,6 +821,9 @@ Với MỖI câu, trả về "bản đồ phát âm":
    [{"word":"differences","syllables":["DIF","fer","en","ces"],"stress_idx":0},
     {"word":"impression","syllables":["im","PRES","sion"],"stress_idx":1}].
    Từ 1 âm tiết vẫn ghi (syllables 1 phần tử, stress_idx 0).
+7. vn_focus: 2–4 lưu ý NGẮN tiếng Việt cho học sinh Việt Nam về CÂU NÀY — lỗi hay gặp:
+   âm cuối /s/ /t/ /d/ /z/, âm /θ/ /ð/, weak form, nối âm, âm dễ nhầm. Dạng
+   ["Đọc rõ /s/ cuối 'countries'", "'to' đọc lướt /tə/", "nối greet‿each", "'th' trong 'the'"].
 
 Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
 CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
@@ -833,6 +860,7 @@ def attach_maps(sentences: list[dict], json_text: str):
                 "tip_vi": item.get("tip_vi", ""),
                 "words": item.get("words", []),
                 "syllable_stress": item.get("syllable_stress", []),
+                "vn_focus": item.get("vn_focus", []),
             }
     n = 0
     for s in sentences:
@@ -858,9 +886,6 @@ def student_app():
         st.markdown(f"**Lớp:** {get_class_name(stu)}")
         if st.button("Đăng xuất"):
             st.session_state.clear(); st.rerun()
-
-    if not require_gemini_key_ui():
-        return
 
     st.header("🎤 Luyện Shadowing")
     lessons = load_lessons()
@@ -904,6 +929,13 @@ def student_app():
                     st.caption(cs)
             if m.get("tip_vi"):
                 st.caption("💡 " + m["tip_vi"])
+            guide = render_syllable_guide(m)
+            if guide:
+                st.markdown("🔑 **Trọng âm cần nhấn (đọc TO & DÀI):** " + guide)
+            vnf = m.get("vn_focus") or []
+            if vnf:
+                st.warning("⚠️ **Chú ý (lỗi người Việt hay sai):**\n"
+                           + "\n".join(f"- {x}" for x in vnf))
         else:
             st.markdown(s["text"])
         st.caption(f"⏱ {s['start']}s → {s['end']}s")
@@ -926,44 +958,22 @@ def student_app():
                 record_listen(stu["id"], lesson["id"], sid)
                 st.rerun()
 
-        takes_key = f"takes_{sid}"
-        takes = st.session_state.setdefault(takes_key, [])
-        KEEP_VISIBLE = 5   # chỉ giữ vài bản gần nhất trên màn hình để chọn chấm
-
-        # Thu xong bản MỚI -> TỰ lưu (không cần bấm Giữ). Nhận diện bản mới bằng chữ ký.
         if len(audio) > 0:
             wav = audiosegment_to_wav_bytes(audio)
+            st.audio(wav, format="audio/wav")
             sig = hashlib.md5(wav).hexdigest()
             if st.session_state.get(f"lastsig_{sid}") != sig:
                 st.session_state[f"lastsig_{sid}"] = sig
                 rec_seconds = len(audio) / 1000.0
                 ok, ratio, heard, reason = free_gates(wav, rec_seconds, s)
                 if ok:
-                    record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio)
-                    takes.append({"wav": wav, "sec": rec_seconds, "match": ratio})
-                    del takes[:-KEEP_VISIBLE]
-                    st.success("✅ Bản này hợp lệ — đã tự lưu, Luyện +1.")
+                    record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio, heard, wav)
+                    st.success(f"✅ Đọc đúng nội dung! (khớp {ratio:.0%}) — Luyện +1. "
+                               "Nghe lại xem đã nhấn đúng trọng âm ở trên chưa nhé.")
                 else:
-                    st.error(reason + " (Thu lại nhé — bản này không được tính.)")
+                    st.error(reason + " Thu lại nhé.")
                 if heard:
-                    st.caption(f"🔎 Máy nghe được: “{heard}” (khớp {ratio:.0%}). "
-                               "Đây chỉ là máy nghe thử để em tự soi — điểm thật do AI chấm.")
-
-        # Danh sách bản gần đây -> chọn 1 bản để chấm
-        if takes:
-            st.markdown(f"**{len(takes)} bản gần nhất** (bản cũ vẫn được tính, chỉ ẩn bớt cho gọn):")
-            for idx, t in enumerate(list(takes)):
-                cc1, cc2 = st.columns([4, 1])
-                cc1.audio(t["wav"], format="audio/wav")
-                cc1.caption(f"Bản {idx + 1} · {t['sec']:.1f}s · khớp {t['match']:.0%}")
-                if cc2.button("🗑 Xoá", key=f"del_{sid}_{idx}"):
-                    takes.pop(idx); st.rerun()
-
-            pick = st.radio("Chọn bản để chấm", range(len(takes)),
-                            format_func=lambda i: f"Bản {i + 1}", horizontal=True,
-                            key=f"pick_{sid}")
-            if st.button("✅ Chấm bản đã chọn", key=f"grade_{sid}", type="primary"):
-                _handle_grade(stu, lesson, s, takes[pick])
+                    st.caption(f"🔎 Máy nghe em đọc: “{heard}”. So với câu gốc xem trượt chỗ nào.")
 
 
 def free_gates(wav, rec_seconds, sentence):
@@ -1103,9 +1113,16 @@ def teacher_compose():
 
     preview = st.session_state.get("preview")
     if preview:
-        st.success(f"Gom được {len(preview)} câu:")
-        st.dataframe(pd.DataFrame(preview)[["sentence_id", "start", "end", "text"]],
-                     use_container_width=True, hide_index=True)
+        st.success(f"Gom được {len(preview)} câu. Sửa lại start/end (giây) hoặc text nếu lệch:")
+        edited = st.data_editor(
+            pd.DataFrame(preview)[["sentence_id", "start", "end", "text"]],
+            hide_index=True, use_container_width=True, key="prev_edit",
+            column_config={"sentence_id": st.column_config.NumberColumn("Câu", disabled=True),
+                           "start": st.column_config.NumberColumn("Bắt đầu (s)"),
+                           "end": st.column_config.NumberColumn("Kết thúc (s)"),
+                           "text": st.column_config.TextColumn("Câu", width="large")})
+        preview = edited.to_dict("records")     # dùng bản đã sửa để lưu
+        st.caption("💡 Dòng nào clip cắt sai thì chỉnh số giây ở đây rồi mới lưu.")
 
         st.markdown("---")
         st.markdown("#### 🗺️ Bản đồ phát âm (tùy chọn)")
@@ -1177,36 +1194,31 @@ def teacher_stats():
             "Bài": lessons.get(r["lesson_id"], {}).get("title", r["lesson_id"]),
             "Câu": r["sentence_id"] + 1,
             "Nghe": r.get("listen_count") or 0,
-            "Luyện": r.get("practice_count") or 0,
-            "Đã chấm": r["total_attempts"],
-            "Cao nhất": r["best_score"],
-            "Thấp nhất": r["worst_score"],
+            "Luyện (đọc đúng)": r.get("practice_count") or 0,
+            "Khớp cao nhất": (f"{r['best_score']}%" if r.get("best_score") is not None else "—"),
             "Lần gần nhất": humanize_since(r.get("last_updated")),
-            "best_url": r["best_audio_url"],
-            "worst_url": r["worst_audio_url"],
-            "best_fb": r.get("best_feedback") or "",
-            "worst_fb": r.get("worst_feedback") or "",
+            "_best_url": r.get("best_audio_url"),
+            "_log": r.get("practice_log") or [],
         })
     df = pd.DataFrame(rows).sort_values(["Học sinh", "Bài", "Câu"]).reset_index(drop=True)
-    st.dataframe(df.drop(columns=["best_url", "worst_url", "best_fb", "worst_fb"]),
-                 use_container_width=True, hide_index=True)
+    st.dataframe(df.drop(columns=["_best_url", "_log"]), use_container_width=True, hide_index=True)
+    st.caption("**Nghe** = số lần bấm nghe · **Luyện** = số lần đọc đúng nội dung · "
+               "**Khớp cao nhất** = độ khớp bản tốt nhất (máy nhận diện).")
 
-    st.markdown("#### 🔊 Nghe + xem AI chấm (Tốt nhất / Tệ nhất)")
+    st.markdown("#### 🔊 Bản đọc tốt nhất + các lần máy nghe được")
     who = st.selectbox("Chọn dòng", df.index,
                        format_func=lambda i: f"{df.loc[i,'Học sinh']} · {df.loc[i,'Bài']} · Câu {df.loc[i,'Câu']}")
-    a, b = st.columns(2)
-    with a:
-        st.markdown(f"🏆 **Tốt nhất — {df.loc[who,'Cao nhất']}/100**")
-        if df.loc[who, "best_url"]:
-            st.audio(df.loc[who, "best_url"])
-        if df.loc[who, "best_fb"]:
-            st.caption(df.loc[who, "best_fb"])
-    with b:
-        st.markdown(f"📉 **Tệ nhất — {df.loc[who,'Thấp nhất']}/100**")
-        if df.loc[who, "worst_url"]:
-            st.audio(df.loc[who, "worst_url"])
-        if df.loc[who, "worst_fb"]:
-            st.caption(df.loc[who, "worst_fb"])
+    if df.loc[who, "_best_url"]:
+        st.audio(df.loc[who, "_best_url"])
+    log = df.loc[who, "_log"] or []
+    if log:
+        st.caption("Các lần đọc gần đây (máy nghe được):")
+        for e in log[-8:][::-1]:
+            try:
+                pct = int(float(e.get("match", 0)) * 100)
+            except Exception:
+                pct = 0
+            st.markdown(f"- *{e.get('heard','(không rõ)')}* — khớp {pct}%")
 
 
 def teacher_dashboard():
