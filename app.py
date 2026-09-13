@@ -83,6 +83,16 @@ def audiosegment_to_wav_bytes(seg) -> bytes:
     return buf.getvalue()
 
 
+GEMINI_KEY_URL = "https://aistudio.google.com/app/apikey"
+
+
+def parse_keys(raw: str) -> list[str]:
+    """Tách nhiều key: mỗi dòng / phẩy / chấm phẩy đều được."""
+    if not raw:
+        return []
+    return [p.strip() for p in re.split(r"[\n,;]+", raw) if p.strip()]
+
+
 # ---------------------------------------------------------------------------
 # TRANSCRIPT PARSER
 # ---------------------------------------------------------------------------
@@ -178,9 +188,10 @@ def find_student_by_profile(profile_id: str) -> dict | None:
     return r.data[0] if r.data else None
 
 
-def save_gemini_key(student_id: str, key: str):
+def save_gemini_keys(student_id: str, raw: str):
+    """Lưu nguyên khối (nhiều dòng) vào cột gemini_api_key."""
     sb.table("assistantapp_students").update(
-        {"gemini_api_key": key.strip()}).eq("id", student_id).execute()
+        {"gemini_api_key": raw.strip()}).eq("id", student_id).execute()
 
 
 def get_class_name(student: dict) -> str:
@@ -211,7 +222,7 @@ def login_ui():
                 st.error(f"Trạng thái '{roster.get('trang_thai')}' — chỉ HS 'Đang học' mới vào được.")
                 return
             st.session_state.student = roster
-            st.session_state.gemini_key = roster.get("gemini_api_key") or ""
+            st.session_state.gemini_keys = parse_keys(roster.get("gemini_api_key") or "")
         elif auth["role"] != "admin":
             st.session_state.clear()
             st.error(f"Role '{auth['role']}' không được hỗ trợ.")
@@ -219,29 +230,43 @@ def login_ui():
         st.rerun()
 
 
+def _key_help():
+    st.markdown(
+        "**Cách lấy Gemini API Key (miễn phí):**\n"
+        f"1. Mở [Google AI Studio]({GEMINI_KEY_URL}) → đăng nhập bằng Gmail.\n"
+        "2. Bấm **Create API key** → **Copy** đoạn mã (bắt đầu bằng `AIza...`).\n"
+        "3. Dán vào ô dưới. **Nên tạo 2–3 key từ 2–3 Gmail khác nhau**, mỗi key một dòng — "
+        "hệ thống tự xoay vòng để đỡ bị hết lượt (lỗi 429)."
+    )
+
+
+def _save_keys_form(stu, existing: list[str], btn_label: str):
+    raw = st.text_area("Mỗi API Key một dòng", value="\n".join(existing),
+                       height=120, key="keys_area",
+                       placeholder="AIzaSy...key1\nAIzaSy...key2\nAIzaSy...key3")
+    if st.button(btn_label, type="primary"):
+        new_keys = parse_keys(raw)
+        if new_keys:
+            save_gemini_keys(stu["id"], "\n".join(new_keys))
+            st.session_state.gemini_keys = new_keys
+            st.success(f"Đã lưu {len(new_keys)} key.")
+            st.rerun()
+        else:
+            st.error("Chưa có key hợp lệ.")
+
+
 def require_gemini_key_ui() -> bool:
     stu = st.session_state.student
-    if st.session_state.get("gemini_key"):
-        with st.expander("🔑 Cập nhật API Key"):
-            new_key = st.text_input("Nhập Key mới", type="password", key="upd_key")
-            if st.button("Lưu Key mới"):
-                if new_key.strip():
-                    save_gemini_key(stu["id"], new_key)
-                    st.session_state.gemini_key = new_key.strip()
-                    st.success("Đã cập nhật Key.")
-                    st.rerun()
+    keys = st.session_state.get("gemini_keys", [])
+    if keys:
+        with st.expander(f"🔑 Cập nhật API Key (đang có {len(keys)} key)"):
+            _key_help()
+            _save_keys_form(stu, keys, "Lưu Key")
         return True
 
     st.warning("Bạn chưa có Gemini API Key. Nhập 1 lần, hệ thống lưu lại cho buổi sau.")
-    key = st.text_input("Gemini API Key", type="password")
-    if st.button("Lưu Key"):
-        if key.strip():
-            save_gemini_key(stu["id"], key)
-            st.session_state.gemini_key = key.strip()
-            st.success("Đã lưu Key.")
-            st.rerun()
-        else:
-            st.error("Key trống.")
+    _key_help()
+    _save_keys_form(stu, [], "Lưu Key")
     return False
 
 
@@ -306,6 +331,26 @@ def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
                                    "403", "permission", "api key", "api_key")):
             raise ValueError("KEY_INVALID")
         raise
+
+
+def score_rotating(keys: list[str], wav_bytes: bytes, target_text: str) -> dict:
+    """
+    Xoay vòng nhiều key để chia tải. Mỗi lượt nộp bắt đầu từ key kế tiếp
+    (round-robin). Key nào dính 429/403 -> tự nhảy sang key sau trong CÙNG lượt.
+    Ném ValueError('ALL_KEYS_DEAD') nếu tất cả key đều hỏng.
+    """
+    if not keys:
+        raise ValueError("ALL_KEYS_DEAD")
+    n = len(keys)
+    start = st.session_state.get("key_rr", 0) % n
+    st.session_state.key_rr = (start + 1) % n          # lượt sau bắt đầu key khác
+    order = [keys[(start + i) % n] for i in range(n)]
+    for k in order:
+        try:
+            return score_with_gemini(k, wav_bytes, target_text)
+        except ValueError:                              # KEY_INVALID -> thử key kế
+            continue
+    raise ValueError("ALL_KEYS_DEAD")
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +497,10 @@ def _handle_submit(stu, lesson, sentence, wav):
 
     try:
         with st.spinner("Đang chấm ngữ điệu bằng AI..."):
-            result = score_with_gemini(st.session_state.gemini_key, wav, sentence["text"])
+            result = score_rotating(st.session_state.gemini_keys, wav, sentence["text"])
     except ValueError:
-        st.error("🔑 Key hết lượt/Không hợp lệ, vui lòng cập nhật lại (mục 'Cập nhật API Key').")
+        st.error("🔑 Tất cả API Key đều hết lượt/không hợp lệ. "
+                 "Vào mục '🔑 Cập nhật API Key' thêm key mới (nên có 2–3 key).")
         return
     except Exception as e:
         st.error(f"Lỗi khi chấm: {e}")
