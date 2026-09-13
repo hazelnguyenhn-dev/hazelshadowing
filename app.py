@@ -39,7 +39,8 @@ GEMINI_MODEL_CANDIDATES = [
     "gemini-2.5-flash-lite",
     "gemini-1.5-flash",
 ]
-LAYER1_MIN_RATIO = 0.50        # đọc đúng nội dung tối thiểu 50%
+LAYER1_MIN_RATIO = 0.85        # đọc đúng từ tối thiểu 85% mới hợp lệ
+#                              # (giọng Việt hay bị máy nghe nhầm -> nếu bị đá nhiều, hạ 0.75–0.80)
 MIN_DURATION_RATIO = 0.60      # bản ghi phải dài ≥ 60% đoạn mẫu
 CAP_PER_DAY = 5                # tối đa số lần CHẤM mỗi câu / ngày
 DEFAULT_TAIL_SEC = 5.0
@@ -636,7 +637,10 @@ thực sự đọc (ngắt nhịp ở đâu, nhấn từ nào, cuối mỗi nh�
 DỰA TRÊN AUDIO — không suy đoán theo lý thuyết sách vở.
 
 Với MỖI câu, trả về "bản đồ phát âm":
-1. chunks: chia câu theo NHÓM THỞ mà người nói NGẮT thực tế trong audio. Mỗi chunk gồm:
+1. chunks: chia câu theo NHÓM NHỊP nhỏ (không phải cả hơi thở dài). Mỗi chunk là một
+   cụm đọc liền quanh 1 trọng âm chính. Đặc biệt: CỤM CỐ ĐỊNH / DANH NGỮ CHẶT
+   (vd "Asian countries", "each other", "common ground", "a good first impression")
+   tách thành 1 CHUNK RIÊNG để thấy rõ nó là 1 đơn vị. Mỗi chunk gồm:
    - text: nguyên văn phần chunk (giữ dấu câu).
    - stress: chỉ đánh dấu NHỊP MẠNH THẬT SỰ nghe được (thường 1–2 nhịp mỗi chunk).
      Từ chức năng (a/the/of/to/and/is...) và từ đọc lướt thì BỎ QUA, đừng nhấn tràn lan.
