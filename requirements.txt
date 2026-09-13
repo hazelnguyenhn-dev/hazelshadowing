@@ -1,0 +1,7 @@
+streamlit>=1.36
+supabase>=2.5
+google-generativeai>=0.7
+streamlit-audiorecorder>=0.0.5
+SpeechRecognition>=3.10
+pydub>=0.25
+pandas>=2.0
