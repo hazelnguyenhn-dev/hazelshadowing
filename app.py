@@ -457,6 +457,25 @@ def save_attempt(student_id, lesson_id, sentence_id, score, wav_bytes, feedback)
             "total": upd["total_attempts"], "today": new_daily}
 
 
+def record_practice(student_id, lesson_id, sentence_id, seconds, match):
+    """Ghi 1 lần LUYỆN hợp lệ (miễn phí, không chấm). Tăng practice_count + log."""
+    now = datetime.now(timezone.utc).isoformat()
+    entry = {"t": now, "sec": round(seconds, 1), "match": round(match, 2)}
+    rec = get_record(student_id, lesson_id, sentence_id)
+    if rec is None:
+        sb.table("assistantapp_shadowing_records").insert({
+            "student_id": student_id, "lesson_id": lesson_id, "sentence_id": sentence_id,
+            "total_attempts": 0, "practice_count": 1, "practice_log": [entry],
+            "last_updated": now,
+        }).execute()
+        return
+    log = (rec.get("practice_log") or [])[-19:] + [entry]      # giữ 20 mục gần nhất
+    sb.table("assistantapp_shadowing_records").update({
+        "practice_count": (rec.get("practice_count") or 0) + 1,
+        "practice_log": log, "last_updated": now,
+    }).eq("id", rec["id"]).execute()
+
+
 # ---------------------------------------------------------------------------
 # UI: YOUTUBE "NGHE MẪU"
 # ---------------------------------------------------------------------------
@@ -726,61 +745,81 @@ def student_app():
         if st.session_state.get(f"show_{sid}"):
             youtube_clip_component(vid, s["start"], s["end"], key=f"{sid}")
 
+        takes_key = f"takes_{sid}"
+        takes = st.session_state.setdefault(takes_key, [])
+        KEEP_VISIBLE = 5   # chỉ giữ vài bản gần nhất trên màn hình để chọn chấm
+
+        # Vừa thu xong 1 bản -> nghe thử + giữ lại
         if len(audio) > 0:
             wav = audiosegment_to_wav_bytes(audio)
             rec_seconds = len(audio) / 1000.0
             st.audio(wav, format="audio/wav")
-            st.caption("Chưa ưng? Bấm 🔴 Thu âm lần nữa để thu lại (không tốn lượt). "
-                       "Ưng rồi mới bấm Chấm.")
-            if st.button("✅ Chấm bản này", key=f"submit_{sid}", type="primary"):
-                _handle_submit(stu, lesson, s, wav, rec_seconds)
+            if st.button("💾 Giữ bản này", key=f"keep_{sid}"):
+                ok, ratio, reason = free_gates(wav, rec_seconds, s)
+                if not ok:
+                    st.error(reason)
+                else:
+                    record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio)
+                    takes.append({"wav": wav, "sec": rec_seconds, "match": ratio})
+                    del takes[:-KEEP_VISIBLE]     # chỉ hiển thị vài bản gần nhất
+                    st.success("✅ Luyện hợp lệ +1! (Đã tính vào tổng số lần thu.)")
+                    st.rerun()
+
+        # Danh sách bản gần đây -> chọn 1 bản để chấm
+        if takes:
+            st.markdown(f"**{len(takes)} bản gần nhất** (bản cũ vẫn được tính, chỉ ẩn bớt cho gọn):")
+            for idx, t in enumerate(list(takes)):
+                cc1, cc2 = st.columns([4, 1])
+                cc1.audio(t["wav"], format="audio/wav")
+                cc1.caption(f"Bản {idx + 1} · {t['sec']:.1f}s · khớp {t['match']:.0%}")
+                if cc2.button("🗑 Xoá", key=f"del_{sid}_{idx}"):
+                    takes.pop(idx); st.rerun()
+
+            pick = st.radio("Chọn bản để chấm", range(len(takes)),
+                            format_func=lambda i: f"Bản {i + 1}", horizontal=True,
+                            key=f"pick_{sid}")
+            if st.button("✅ Chấm bản đã chọn", key=f"grade_{sid}", type="primary"):
+                _handle_grade(stu, lesson, s, takes[pick])
 
 
-def _handle_submit(stu, lesson, sentence, wav, rec_seconds):
-    sid = sentence["sentence_id"]
+def free_gates(wav, rec_seconds, sentence):
+    """Cửa miễn phí: đủ dài + đọc đúng nội dung. Trả (ok, ratio, lý_do_lỗi)."""
     sample_len = float(sentence["end"]) - float(sentence["start"])
     need = max(1.0, MIN_DURATION_RATIO * sample_len)
-
-    # Cửa 1 (miễn phí): đủ dài chưa?
     if rec_seconds < need:
-        st.error(f"❌ Bản ghi quá ngắn ({rec_seconds:.1f}s, cần ≥ {need:.1f}s). "
-                 "Đọc trọn cả câu rồi hãy chấm — KHÔNG tính lượt.")
-        return
-
-    # Cửa 2 (miễn phí): đọc đúng nội dung chưa?
-    with st.spinner("Đang kiểm tra nhanh..."):
-        ok1, ratio, heard = layer1_check(wav, sentence["text"])
+        return False, 0.0, (f"❌ Quá ngắn ({rec_seconds:.1f}s, cần ≥ {need:.1f}s). "
+                            "Đọc trọn cả câu nhé — bản này không được tính.")
+    ok1, ratio, heard = layer1_check(wav, sentence["text"])
     if not ok1:
-        st.error(f"❌ Đọc sai nội dung / nói linh tinh (khớp {ratio:.0%}). "
-                 f"KHÔNG tính lượt. (Máy nghe được: “{heard or 'không rõ'}”)")
-        return
+        return False, ratio, (f"❌ Đọc sai nội dung / nói linh tinh (khớp {ratio:.0%}). "
+                              f"Không tính. (Máy nghe được: “{heard or 'không rõ'}”)")
+    return True, ratio, ""
 
-    # Cửa 3 (miễn phí): còn lượt chấm hôm nay không?
+
+def _handle_grade(stu, lesson, sentence, take):
+    sid = sentence["sentence_id"]
     rec = get_record(stu["id"], lesson["id"], sid)
     if scored_today(rec) >= CAP_PER_DAY:
         st.warning(f"⏳ Câu này đã chấm đủ {CAP_PER_DAY} lần hôm nay. "
-                   "Cứ luyện thêm (nghe mẫu, thu lại) và quay lại ngày mai nhé — "
-                   "để dành lượt API.")
+                   "Cứ luyện thêm, để dành lượt cho mai nhé.")
         return
 
-    # Cửa 4 (tốn API): chấm + chống giọng máy
     try:
         with st.spinner("Đang chấm ngữ điệu bằng AI..."):
-            result = score_rotating(st.session_state.gemini_keys, wav, sentence["text"])
+            result = score_rotating(st.session_state.gemini_keys, take["wav"], sentence["text"])
     except ValueError:
         st.error("🔑 Tất cả API Key đều hết lượt/không hợp lệ. "
-                 "Vào mục '🔑 Cập nhật API Key' thêm key mới (nên có 2–3 key).")
+                 "Vào '🔑 Cập nhật API Key' thêm key mới (nên 2–3 key).")
         return
     except Exception as e:
         st.error(f"Lỗi khi chấm: {e}")
         return
 
     if result["is_cheating"]:
-        st.error("🚨 Phát hiện gian lận dùng AI/máy đọc hộ — hủy bài, KHÔNG tính lượt!")
+        st.error("🚨 Phát hiện gian lận dùng AI/máy đọc hộ — hủy, KHÔNG tính!")
         return
 
-    # Hợp lệ -> +1 attempt, cập nhật best/worst kèm nhận xét
-    info = save_attempt(stu["id"], lesson["id"], sid, result["score"], wav, result["feedback"])
+    info = save_attempt(stu["id"], lesson["id"], sid, result["score"], take["wav"], result["feedback"])
     score = result["score"]
     color = "green" if score >= 75 else ("orange" if score >= 50 else "red")
     st.markdown(f"### Điểm: :{color}[{score}/100]")
@@ -788,8 +827,8 @@ def _handle_submit(stu, lesson, sentence, wav, rec_seconds):
 
     issues = result.get("issues") or []
     if issues:
-        issue_words = [i.get("word", "") for i in issues]
-        st.markdown("**Chỗ cần sửa:** " + highlight_issue_words(sentence["text"], issue_words))
+        st.markdown("**Chỗ cần sửa:** " +
+                    highlight_issue_words(sentence["text"], [i.get("word", "") for i in issues]))
         for i in issues:
             st.caption(f"• **{i.get('word','')}** — {i.get('problem_vi','')}")
 
@@ -797,11 +836,10 @@ def _handle_submit(stu, lesson, sentence, wav, rec_seconds):
     if info["new_best"]:
         badges.append("🏆 Kỷ lục cao mới!")
     if info["new_worst"]:
-        badges.append("📉 Điểm thấp mới (đã lưu để đối chiếu)")
+        badges.append("📉 Điểm thấp mới")
     if badges:
         st.info(" · ".join(badges))
-    st.caption(f"Tổng lần chấm hợp lệ câu này: {info['total']} · "
-               f"Hôm nay: {info['today']}/{CAP_PER_DAY}")
+    st.caption(f"Đã chấm câu này: {info['total']} lần · Hôm nay: {info['today']}/{CAP_PER_DAY}")
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +943,8 @@ def teacher_stats():
                          or students.get(r["student_id"], {}).get("nick_name") or r["student_id"]),
             "Bài": lessons.get(r["lesson_id"], {}).get("title", r["lesson_id"]),
             "Câu": r["sentence_id"] + 1,
-            "Số lần chấm": r["total_attempts"],
+            "Luyện": r.get("practice_count") or 0,
+            "Đã chấm": r["total_attempts"],
             "Cao nhất": r["best_score"],
             "Thấp nhất": r["worst_score"],
             "Lần gần nhất": humanize_since(r.get("last_updated")),
