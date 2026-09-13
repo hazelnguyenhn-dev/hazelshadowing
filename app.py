@@ -358,14 +358,9 @@ GEMINI_PROMPT = """Bạn là giám khảo IELTS chấm phát âm.
    (đọc phẳng, không nhấn trọng âm, sai âm). Mỗi cái:
    {"word": "<từ trong câu gốc>", "problem_vi": "<lỗi ngắn gọn tiếng Việt>"}.
    Nếu đọc tốt thì để [].
-4. stress_check: chọn 4–6 TỪ chính trong câu (gồm từ ĐÁNG nhấn + vài từ đọc lướt cạnh nó).
-   Với mỗi từ, chấm ĐỘ NỔI mà HỌC SINH THỰC SỰ đọc (to & dài = nổi): level 0-100.
-   Từ đáng nhấn mà học sinh đọc lướt/ngắn → level THẤP. Dạng
-   [{"word":"greet","level":45},{"word":"each","level":40},{"word":"other","level":35}].
-5. CHỈ trả về JSON, không thêm chữ nào khác:
+4. CHỈ trả về JSON, không thêm chữ nào khác:
 {"is_cheating": boolean, "score": number (0-100), "feedback": "lời khuyên ngắn tiếng Việt",
-"issues": [{"word": "...", "problem_vi": "..."}],
-"stress_check": [{"word": "...", "level": number}]}
+"issues": [{"word": "...", "problem_vi": "..."}]}
 
 Câu gốc học sinh cần đọc: "%s"
 """
@@ -380,10 +375,17 @@ def _list_models_str(genai) -> str:
         return f"(không liệt kê được: {e})"
 
 
-def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
+def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str,
+                      stress_targets: str = "") -> dict:
     import google.generativeai as genai
     genai.configure(api_key=api_key)
     prompt = GEMINI_PROMPT % target_text
+    if stress_targets:
+        prompt += ("\n\nĐÁNH GIÁ TRỌNG ÂM cho các từ dưới (định dạng: từ = âm1-âm2-âm3 | "
+                   "âm tiết ĐÚNG cần nhấn). Nghe học sinh đọc rồi phán mỗi từ:\n"
+                   + stress_targets +
+                   '\nThêm khoá "stress_result": [{"word":"...","result":"correct"|"flat"|"wrong",'
+                   '"hit":"<âm tiết học sinh nhấn nếu wrong, else empty>"}].')
     audio = {"mime_type": "audio/wav", "data": wav_bytes}
 
     cached = st.session_state.get("gemini_model")
@@ -399,7 +401,7 @@ def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
             data["is_cheating"] = bool(data.get("is_cheating", False))
             data["feedback"] = str(data.get("feedback", ""))
             data["issues"] = [i for i in (data.get("issues") or []) if isinstance(i, dict)]
-            data["stress_check"] = [x for x in (data.get("stress_check") or []) if isinstance(x, dict)]
+            data["stress_result"] = [x for x in (data.get("stress_result") or []) if isinstance(x, dict)]
             st.session_state.gemini_model = name          # nhớ model chạy được
             return data
         except Exception as e:
@@ -415,7 +417,8 @@ def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
                        "Model khả dụng: " + _list_models_str(genai))
 
 
-def score_rotating(keys: list[str], wav_bytes: bytes, target_text: str) -> dict:
+def score_rotating(keys: list[str], wav_bytes: bytes, target_text: str,
+                   stress_targets: str = "") -> dict:
     """
     Xoay vòng nhiều key để chia tải. Mỗi lượt nộp bắt đầu từ key kế tiếp
     (round-robin). Key nào dính 429/403 -> tự nhảy sang key sau trong CÙNG lượt.
@@ -429,7 +432,7 @@ def score_rotating(keys: list[str], wav_bytes: bytes, target_text: str) -> dict:
     order = [keys[(start + i) % n] for i in range(n)]
     for k in order:
         try:
-            return score_with_gemini(k, wav_bytes, target_text)
+            return score_with_gemini(k, wav_bytes, target_text, stress_targets)
         except ValueError:                              # KEY_INVALID -> thử key kế
             continue
     raise ValueError("ALL_KEYS_DEAD")
@@ -789,10 +792,11 @@ Với MỖI câu, trả về "bản đồ phát âm":
      from, was, are, that...): ghi dạng CÒN LẠI để học sinh tự nghe chọn.
      VD can: ipa "kən" (weak) + ipa_alt "kæn" (strong); at: "ət" + "æt"; to: "tə" + "tuː".
    - Từ nội dung (danh/động/tính...) chỉ cần ipa, ĐỂ ipa_alt = "".
-6. model_stress: chấm ĐỘ NỔI của CHÍNH NGƯỜI NÓI trong audio cho 4–6 TỪ chính
-   (gồm từ đáng nhấn + vài từ đọc lướt cạnh nó), level 0-100 (to & dài = nổi).
-   Đây là "chuẩn" để học sinh so sánh. Dạng
-   [{"word":"greet","level":85},{"word":"each","level":35},{"word":"other","level":30}].
+6. syllable_stress: cho 3–6 TỪ chính (ưu tiên từ NHIỀU ÂM TIẾT), tách ÂM TIẾT và chỉ ra
+   âm tiết NHẤN (theo từ điển giọng Mỹ). Dạng
+   [{"word":"differences","syllables":["DIF","fer","en","ces"],"stress_idx":0},
+    {"word":"impression","syllables":["im","PRES","sion"],"stress_idx":1}].
+   Từ 1 âm tiết vẫn ghi (syllables 1 phần tử, stress_idx 0).
 
 Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
 CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
@@ -828,7 +832,7 @@ def attach_maps(sentences: list[dict], json_text: str):
                 "connected_speech": item.get("connected_speech", []),
                 "tip_vi": item.get("tip_vi", ""),
                 "words": item.get("words", []),
-                "model_stress": item.get("model_stress", []),
+                "syllable_stress": item.get("syllable_stress", []),
             }
     n = 0
     for s in sentences:
@@ -984,9 +988,18 @@ def _handle_grade(stu, lesson, sentence, take):
                    "Cứ luyện thêm, để dành lượt cho mai nhé.")
         return
 
+    syl = (sentence.get("map") or {}).get("syllable_stress") or []
+    stress_targets = ""
+    for w in syl:
+        sylls = w.get("syllables") or []
+        idx = w.get("stress_idx", 0)
+        correct = sylls[idx] if 0 <= idx < len(sylls) else (sylls[0] if sylls else "")
+        stress_targets += f'{w.get("word","")} = {"-".join(sylls)} | nhấn: {correct}\n'
+
     try:
         with st.spinner("Đang chấm ngữ điệu bằng AI..."):
-            result = score_rotating(st.session_state.gemini_keys, take["wav"], sentence["text"])
+            result = score_rotating(st.session_state.gemini_keys, take["wav"],
+                                    sentence["text"], stress_targets)
     except ValueError:
         st.error("🔑 Tất cả API Key đều hết lượt/không hợp lệ. "
                  "Vào '🔑 Cập nhật API Key' thêm key mới (nên 2–3 key).")
@@ -1022,40 +1035,43 @@ def _handle_grade(stu, lesson, sentence, take):
     st.caption(f"Đã chấm câu này: {info['total']} lần · Hôm nay: {info['today']}/{CAP_PER_DAY}")
 
     rms, verdict, _flat = energy_curve(take["wav"])
-    stu_sc = result.get("stress_check") or []
-    model_sc = (sentence.get("map") or {}).get("model_stress") or []
-
-    def _lvl(x):
-        try:
-            return max(0.0, min(100.0, float(x.get("level", 0))))
-        except Exception:
-            return 0.0
-
-    if model_sc:
-        stu_map = {_norm_word(x.get("word", "")): _lvl(x) for x in stu_sc}
-        seen, idx, mvals, svals = {}, [], [], []
-        for x in model_sc:
-            w = (str(x.get("word", "")).strip() or "?")
-            seen[w] = seen.get(w, 0) + 1
-            idx.append(w if seen[w] == 1 else f"{w} ({seen[w]})")
-            mvals.append(_lvl(x))
-            svals.append(stu_map.get(_norm_word(w), 0.0))
-        st.markdown("**🎯 Độ nổi từng từ — Mẫu vs Em:**")
-        st.bar_chart(pd.DataFrame({"Mẫu": mvals, "Em": svals}, index=idx))
-        st.caption("Chỗ cột **Mẫu** cao (từ được nhấn) thì cột **Em** cũng phải cao theo. "
-                   + (verdict or ""))
-    elif stu_sc:
-        seen, idx, vals = {}, [], []
-        for x in stu_sc:
-            w = (str(x.get("word", "")).strip() or "?")
-            seen[w] = seen.get(w, 0) + 1
-            idx.append(w if seen[w] == 1 else f"{w} ({seen[w]})")
-            vals.append(_lvl(x))
-        st.markdown("**🎯 Độ nổi từng từ (em vừa đọc):**")
-        st.bar_chart(pd.DataFrame({"độ nổi": vals}, index=idx))
-        st.caption("Cột cao = đọc TO & DÀI. Từ trọng âm phải cao hơn từ lướt. " + (verdict or ""))
+    if syl:
+        res_map = {_norm_word(x.get("word", "")): x for x in (result.get("stress_result") or [])}
+        idx, mvals, evals, seen = [], [], [], {}
+        for w in syl:
+            sylls = w.get("syllables") or []
+            sidx = w.get("stress_idx", 0)
+            r = res_map.get(_norm_word(w.get("word", "")), {})
+            rv = r.get("result", "")
+            hit = _norm_word(r.get("hit", ""))
+            for i, t in enumerate(sylls):
+                seen[t] = seen.get(t, 0) + 1
+                idx.append(t if seen[t] == 1 else f"{t}\u00b7{seen[t]}")
+                mvals.append(100 if i == sidx else 45)
+                if rv == "correct":
+                    ev = 100 if i == sidx else 45
+                elif rv == "wrong":
+                    ev = 100 if (hit and _norm_word(t) == hit) else 45
+                elif rv == "flat":
+                    ev = 65
+                else:
+                    ev = 65
+                evals.append(ev)
+        if idx:
+            st.markdown("**\U0001F3AF Nh\u1ecbp tr\u1ecdng \u00e2m \u2014 M\u1eabu vs Em** (c\u1ed9t cao = nh\u1ea5n TO & D\u00c0I):")
+            st.bar_chart(pd.DataFrame({"M\u1eabu": mvals, "Em": evals}, index=idx))
+            badges = []
+            for w in syl:
+                rv = res_map.get(_norm_word(w.get("word", "")), {}).get("result", "")
+                sym = {"correct": "\u2705", "flat": "\u26a0\ufe0f", "wrong": "\u274c"}.get(rv, "")
+                if sym:
+                    badges.append(f"{w.get('word','')} {sym}")
+            st.caption("C\u1ed9t **M\u1eabu** v\u1ed1ng cao \u1edf \u00e2m c\u1ea7n nh\u1ea5n. **Em** ph\u1eb3ng \u0111\u1ec1u = ch\u01b0a nh\u1ea5n; cao \u0111\u00fang ch\u1ed7 M\u1eabu = \u0111\u1ea1t."
+                       + ("  \u2022  " + " \u00b7 ".join(badges) if badges else ""))
+        if verdict:
+            st.caption("\U0001F30A " + verdict)
     elif verdict:
-        st.caption("🌊 " + verdict)
+        st.caption("\U0001F30A " + verdict)
 
 
 # ---------------------------------------------------------------------------
