@@ -640,6 +640,10 @@ def extract_json_array(text: str):
 
 
 TEACHER_MAP_PROMPT = """Bạn là chuyên gia phát âm tiếng Anh cho học sinh Việt Nam (A1–B1).
+DÙNG GIỌNG MỸ (General American) cho MỌI phiên âm, IPA, nối/nuốt âm và flap —
+KHÔNG dùng giọng Anh (RP). Cụ thể: /r/ đọc hết (rhotic, vd "water" /ˈwɑːtər/);
+/t/,/d/ giữa 2 nguyên âm thành flap (water→wa-der, get it→ge-dit);
+"dance/ask/can't" dùng /æ/; "hot/dog" dùng /ɑ/.
 Tôi ĐÍNH KÈM một file audio (mp3) và danh sách câu, mỗi dòng: ID | start–end (giây) | câu.
 Hãy NGHE đúng đoạn từ start đến end của TỪNG câu, rồi mô tả CÁCH NGƯỜI NÓI TRONG AUDIO
 thực sự đọc (ngắt nhịp ở đâu, nhấn từ nào, cuối mỗi nhịp lên hay xuống giọng).
