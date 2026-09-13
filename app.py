@@ -340,7 +340,7 @@ def layer1_check(wav_bytes: bytes, target_text: str):
     except sr.UnknownValueError:
         return False, 0.0, ""
     except Exception:
-        return True, 1.0, ""
+        return True, 0.0, ""          # mạng nhận diện lỗi -> vẫn cho qua, nhưng KHÔNG báo 100%
 
     def norm(s):
         return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
@@ -968,8 +968,12 @@ def student_app():
                 ok, ratio, heard, reason = free_gates(wav, rec_seconds, s)
                 if ok:
                     record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio, heard, wav)
-                    st.success(f"✅ Đọc đúng nội dung! (khớp {ratio:.0%}) — Luyện +1. "
-                               "Nghe lại xem đã nhấn đúng trọng âm ở trên chưa nhé.")
+                    if heard:
+                        st.success(f"✅ Đọc đúng nội dung! (khớp {ratio:.0%}) — Luyện +1. "
+                                   "Nghe lại xem đã nhấn đúng trọng âm ở trên chưa nhé.")
+                    else:
+                        st.success("✅ Đã lưu (Luyện +1). Mạng nhận diện chập chờn nên "
+                                   "chưa ghi được chữ lần này — thử thu lại nếu muốn lưu chữ.")
                 else:
                     st.error(reason + " Thu lại nhé.")
                 if heard:
@@ -1218,7 +1222,12 @@ def teacher_stats():
                 pct = int(float(e.get("match", 0)) * 100)
             except Exception:
                 pct = 0
-            st.markdown(f"- *{e.get('heard','(không rõ)')}* — khớp {pct}%")
+            heard = e.get("heard")
+            if heard is None:
+                heard = "(bản cũ — chưa lưu chữ)"
+            elif not heard.strip():
+                heard = "(máy không nghe được lần này)"
+            st.markdown(f"- *{heard}* — khớp {pct}%")
 
 
 def teacher_dashboard():
