@@ -780,7 +780,7 @@ def student_app():
             if st.session_state.get(f"lastsig_{sid}") != sig:
                 st.session_state[f"lastsig_{sid}"] = sig
                 rec_seconds = len(audio) / 1000.0
-                ok, ratio, reason = free_gates(wav, rec_seconds, s)
+                ok, ratio, heard, reason = free_gates(wav, rec_seconds, s)
                 if ok:
                     record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio)
                     takes.append({"wav": wav, "sec": rec_seconds, "match": ratio})
@@ -788,6 +788,9 @@ def student_app():
                     st.success("✅ Bản này hợp lệ — đã tự lưu, Luyện +1.")
                 else:
                     st.error(reason + " (Thu lại nhé — bản này không được tính.)")
+                if heard:
+                    st.caption(f"🔎 Máy nghe được: “{heard}” (khớp {ratio:.0%}). "
+                               "Đây chỉ là máy nghe thử để em tự soi — điểm thật do AI chấm.")
 
         # Danh sách bản gần đây -> chọn 1 bản để chấm
         if takes:
@@ -807,17 +810,17 @@ def student_app():
 
 
 def free_gates(wav, rec_seconds, sentence):
-    """Cửa miễn phí: đủ dài + đọc đúng nội dung. Trả (ok, ratio, lý_do_lỗi)."""
+    """Cửa miễn phí: đủ dài + đọc đúng nội dung. Trả (ok, ratio, heard, lý_do_lỗi)."""
     sample_len = float(sentence["end"]) - float(sentence["start"])
     need = max(1.0, MIN_DURATION_RATIO * sample_len)
     if rec_seconds < need:
-        return False, 0.0, (f"❌ Quá ngắn ({rec_seconds:.1f}s, cần ≥ {need:.1f}s). "
-                            "Đọc trọn cả câu nhé — bản này không được tính.")
+        return False, 0.0, "", (f"❌ Quá ngắn ({rec_seconds:.1f}s, cần ≥ {need:.1f}s). "
+                                "Đọc trọn cả câu nhé — bản này không được tính.")
     ok1, ratio, heard = layer1_check(wav, sentence["text"])
     if not ok1:
-        return False, ratio, (f"❌ Đọc sai nội dung / nói linh tinh (khớp {ratio:.0%}). "
-                              f"Không tính. (Máy nghe được: “{heard or 'không rõ'}”)")
-    return True, ratio, ""
+        return False, ratio, heard, (f"❌ Đọc sai nội dung / nói linh tinh (khớp {ratio:.0%}). "
+                                     "Không tính.")
+    return True, ratio, heard, ""
 
 
 def _handle_grade(stu, lesson, sentence, take):
