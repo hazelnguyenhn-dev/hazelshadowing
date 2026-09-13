@@ -231,12 +231,20 @@ def login_ui():
 
 
 def _key_help():
+    st.link_button("🔗 Mở Google AI Studio để lấy Key", GEMINI_KEY_URL,
+                   use_container_width=True)
     st.markdown(
-        "**Cách lấy Gemini API Key (miễn phí):**\n"
-        f"1. Mở [Google AI Studio]({GEMINI_KEY_URL}) → đăng nhập bằng Gmail.\n"
-        "2. Bấm **Create API key** → **Copy** đoạn mã (bắt đầu bằng `AIza...`).\n"
-        "3. Dán vào ô dưới. **Nên tạo 2–3 key từ 2–3 Gmail khác nhau**, mỗi key một dòng — "
-        "hệ thống tự xoay vòng để đỡ bị hết lượt (lỗi 429)."
+        """
+##### 📌 Cách lấy Gemini API Key (miễn phí)
+1. Bấm nút xanh ở trên → **đăng nhập bằng Gmail** của em.
+2. Bấm **Create API key** (Tạo khoá API).
+3. Bấm **Copy** để sao chép mã — mã bắt đầu bằng `AIza...`.
+4. Quay lại đây, **dán vào ô bên dưới**.
+
+> 💡 **Nên tạo 2–3 key từ 2–3 Gmail khác nhau**, dán cả 2–3 vào — **mỗi key một dòng**.
+> App sẽ tự xoay vòng để em **không bị hết lượt giữa buổi** (lỗi 429).
+> Key này miễn phí và chỉ của riêng em.
+        """
     )
 
 
@@ -303,9 +311,14 @@ GEMINI_PROMPT = """Bạn là giám khảo IELTS chấm phát âm.
    Dấu hiệu máy: không có tiếng thở, đều đều, mượt bất thường, không nhiễu nền tự nhiên.
    Nếu là máy đọc hộ, gán is_cheating = true.
 2. CHẤM ĐIỂM: Đánh giá Word Stress (trọng âm từ) và Sentence Stress (ngữ điệu câu)
-   so với câu gốc. Chỉ ra cụ thể từ nào đọc lướt, không nhấn đúng trọng âm.
-3. CHỈ trả về JSON, không thêm chữ nào khác:
-{"is_cheating": boolean, "score": number (0-100), "feedback": "lời khuyên chi tiết tiếng Việt"}
+   so với câu gốc.
+3. issues: tối đa 2 TỪ (lấy đúng từ trong câu gốc) mà học sinh đọc SAI RÕ nhất
+   (đọc phẳng, không nhấn trọng âm, sai âm). Mỗi cái:
+   {"word": "<từ trong câu gốc>", "problem_vi": "<lỗi ngắn gọn tiếng Việt>"}.
+   Nếu đọc tốt thì để [].
+4. CHỈ trả về JSON, không thêm chữ nào khác:
+{"is_cheating": boolean, "score": number (0-100), "feedback": "lời khuyên ngắn tiếng Việt",
+"issues": [{"word": "...", "problem_vi": "..."}]}
 
 Câu gốc học sinh cần đọc: "%s"
 """
@@ -324,6 +337,7 @@ def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
         data["score"] = int(round(float(data.get("score", 0))))
         data["is_cheating"] = bool(data.get("is_cheating", False))
         data["feedback"] = str(data.get("feedback", ""))
+        data["issues"] = [i for i in (data.get("issues") or []) if isinstance(i, dict)]
         return data
     except Exception as e:
         msg = str(e).lower()
@@ -405,23 +419,45 @@ def youtube_clip_component(video_id: str, start: float, end: float, key: str):
     import streamlit.components.v1 as components
     html = f"""
     <div id="player_{key}"></div>
+    <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="replay_{key}" style="padding:8px 14px; border-radius:8px;
+        border:1px solid #ccc; background:#f6f6f6; cursor:pointer; font-size:15px;">
+        🔁 Nghe lại đoạn</button>
+      <label style="font-size:14px; cursor:pointer;">
+        <input type="checkbox" id="loop_{key}"> Lặp tự động</label>
+      <span style="font-size:13px; color:#888;">({start}s → {end}s)</span>
+    </div>
     <script>
+      var seg_{key} = {{start: {start}, end: {end}, player: null, loop: false}};
+      function playSeg_{key}() {{
+        var p = seg_{key}.player;
+        if (p) {{ p.seekTo(seg_{key}.start, true); p.playVideo(); }}
+      }}
       function load_{key}() {{
         new YT.Player('player_{key}', {{
           height: '220', width: '100%',
           videoId: '{video_id}',
-          playerVars: {{start: {int(start)}, autoplay: 1, controls: 1}},
+          playerVars: {{start: {int(start)}, controls: 1}},
           events: {{
             'onReady': function(e) {{
-              e.target.seekTo({start}, true); e.target.playVideo();
-              var iv = setInterval(function() {{
-                if (e.target.getCurrentTime() >= {end}) {{
-                  e.target.pauseVideo(); clearInterval(iv);
+              seg_{key}.player = e.target;
+              playSeg_{key}();
+              setInterval(function() {{
+                var p = seg_{key}.player;
+                if (!p || !p.getCurrentTime) return;
+                if (p.getCurrentTime() >= seg_{key}.end) {{
+                  if (seg_{key}.loop) {{ p.seekTo(seg_{key}.start, true); p.playVideo(); }}
+                  else {{ p.pauseVideo(); }}
                 }}
-              }}, 200);
+              }}, 150);
             }}
           }}
         }});
+        document.getElementById('replay_{key}').onclick = playSeg_{key};
+        document.getElementById('loop_{key}').onchange = function(ev) {{
+          seg_{key}.loop = ev.target.checked;
+          if (seg_{key}.loop) playSeg_{key}();
+        }};
       }}
       if (window.YT && window.YT.Player) {{ load_{key}(); }}
       else {{
@@ -432,7 +468,151 @@ def youtube_clip_component(video_id: str, start: float, end: float, key: str):
       }}
     </script>
     """
-    components.html(html, height=250)
+    components.html(html, height=310)
+
+
+# ---------------------------------------------------------------------------
+# PRONUNCIATION MAP  (render bản đồ ngữ điệu câu mẫu)
+# ---------------------------------------------------------------------------
+TONE_ARROW = {"level": "→", "rise": "↗", "fall": "↘", "fall-rise": "↘↗"}
+CS_LABEL = {"linking": "nối âm", "elision": "nuốt âm", "assimilation": "đổi âm",
+            "intrusion": "chèn âm", "gemination": "gộp âm"}
+
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (w or "").lower())
+
+
+def _bold_frag_in_word(word: str, frags: list[str]) -> str:
+    """Bôi đậm âm tiết trọng âm bên trong 1 từ (frag đầu tiên khớp)."""
+    for frag in frags:
+        f = (frag or "").strip()
+        if not f:
+            continue
+        m = re.search(re.escape(f), word, flags=re.I)
+        if m:
+            s, e = m.start(), m.end()
+            return word[:s] + "**" + word[s:e] + "**" + word[e:]
+    return word
+
+
+def _render_chunk_words(chunk_text: str, stress: list[str], focus: str) -> str:
+    fnorm = _norm_word(focus) if focus else None
+    out = []
+    for w in (chunk_text or "").split():
+        core, trail = w, ""
+        m = re.search(r"[.,!?;:]+$", w)
+        if m:
+            core, trail = w[:m.start()], w[m.start():]
+        if fnorm and _norm_word(core) == fnorm:
+            disp = f":red[**{core}**]"                       # sentence stress
+        else:
+            frags = [f for f in (stress or []) if re.search(re.escape(f), core, flags=re.I)]
+            disp = _bold_frag_in_word(core, frags) if frags else core
+        out.append(disp + trail)
+    return " ".join(out)
+
+
+def render_map_basic(m: dict) -> str:
+    parts = [_render_chunk_words(c.get("text", ""), c.get("stress", []), m.get("focus"))
+             for c in m.get("chunks", [])]
+    return " ".join(parts)
+
+
+def render_map_full(m: dict) -> str:
+    segs = []
+    for c in m.get("chunks", []):
+        txt = _render_chunk_words(c.get("text", ""), c.get("stress", []), m.get("focus"))
+        arrow = TONE_ARROW.get(c.get("tone", ""), "")
+        segs.append(f"{txt} {arrow}".strip())
+    return "  |  ".join(segs)
+
+
+def render_connected_speech(m: dict) -> str:
+    cs = m.get("connected_speech") or []
+    if not cs:
+        return ""
+    items = [f'{c.get("span","")} → *{c.get("sounds_like","")}* '
+             f'({CS_LABEL.get(c.get("type",""), c.get("type",""))})' for c in cs]
+    return "🔗 " + "  ·  ".join(items)
+
+
+def highlight_issue_words(text: str, words: list[str]) -> str:
+    out = text
+    for w in words:
+        w = (w or "").strip()
+        if not w:
+            continue
+        out = re.sub(r"(?i)\b(" + re.escape(w) + r")\b", r":red[**\1**]", out, count=1)
+    return out
+
+
+def extract_json_array(text: str):
+    text = re.sub(r"```json|```", "", text).strip()
+    s, e = text.find("["), text.rfind("]")
+    if s == -1 or e == -1:
+        raise ValueError("Không tìm thấy JSON array")
+    return json.loads(text[s:e + 1])
+
+
+TEACHER_MAP_PROMPT = """Bạn là chuyên gia phát âm tiếng Anh cho học sinh Việt Nam (A1–B1).
+Tôi đưa danh sách câu (mỗi dòng: ID | câu). Với MỖI câu, tạo "bản đồ phát âm".
+
+QUY TẮC:
+1. chunks: chia câu thành các NHÓM THỞ (sense groups). Mỗi chunk gồm:
+   - text: nguyên văn phần chunk (giữ dấu câu).
+   - stress: các ÂM TIẾT mang trọng âm TỪ trong chunk (vd "por" cho "important",
+     "bought" cho từ một âm tiết). Chỉ nhấn từ nội dung (danh/động/tính/trạng từ,
+     từ để hỏi). KHÔNG nhấn a/the/to/of/is/and...
+   - tone: hướng giọng CUỐI chunk, chọn đúng 1:
+       "level" = giữ NGANG (dùng cho các món khi LIỆT KÊ giữa câu — KHÔNG dùng "rise"),
+       "rise"  = LÊN giọng (câu hỏi yes/no),
+       "fall"  = XUỐNG giọng (hết ý, câu kể, câu hỏi wh-),
+       "fall-rise" = xuống-lên (lửng lơ, chưa hết ý).
+2. focus: MỘT từ mang trọng âm CÂU (nhấn mạnh nhất), thường là từ nội dung cuối.
+3. connected_speech: hiện tượng nối/nuốt âm, mỗi cái {type, span, sounds_like, note_vi}.
+   type ∈ linking, elision, assimilation, intrusion, gemination.
+   CHỈ ghi cái RÕ RÀNG và thường gặp — ĐỪNG đánh dấu thừa. Không có thì để [].
+4. tip_vi: 1 câu tiếng Việt NGẮN, chỉ điểm quan trọng nhất.
+
+CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
+[{"sentence_id":0,"chunks":[{"text":"He bought","stress":["bought"],"tone":"level"},
+{"text":"apples,","stress":["ap"],"tone":"level"},{"text":"and oranges.","stress":["or"],"tone":"fall"}],
+"focus":"oranges","connected_speech":[],"tip_vi":"Liệt kê: giữ ngang, tới 'oranges' mới hạ giọng."}]
+
+DANH SÁCH CÂU:
+"""
+
+
+def build_teacher_prompt(sentences: list[dict]) -> str:
+    lines = [f'{s["sentence_id"]} | {s["text"]}' for s in sentences]
+    return TEACHER_MAP_PROMPT + "\n".join(lines)
+
+
+def attach_maps(sentences: list[dict], json_text: str):
+    """Trả (sentences, n_gắn). n = -1 nếu JSON lỗi."""
+    if not (json_text or "").strip():
+        return sentences, 0
+    try:
+        arr = extract_json_array(json_text)
+    except Exception:
+        return sentences, -1
+    by_id = {}
+    for item in arr:
+        sid = item.get("sentence_id")
+        if isinstance(sid, int):
+            by_id[sid] = {
+                "chunks": item.get("chunks", []),
+                "focus": item.get("focus"),
+                "connected_speech": item.get("connected_speech", []),
+                "tip_vi": item.get("tip_vi", ""),
+            }
+    n = 0
+    for s in sentences:
+        if s["sentence_id"] in by_id:
+            s["map"] = by_id[s["sentence_id"]]
+            n += 1
+    return sentences, n
 
 
 # ---------------------------------------------------------------------------
@@ -467,23 +647,45 @@ def student_app():
     vid = youtube_id(lesson["youtube_link"])
     sentences = lesson.get("sentences") or []
 
+    mode = st.radio("Chế độ hiển thị", ["Cơ bản", "Đầy đủ"],
+                    horizontal=True, key="disp_mode")
+    if mode == "Đầy đủ":
+        st.caption("→ giữ ngang · ↗ lên · ↘ xuống · ↘↗ lửng lơ · "
+                   "**đậm** = trọng âm từ · :red[đỏ] = nhấn mạnh nhất câu")
+
     for s in sentences:
         sid = s["sentence_id"]
         st.divider()
-        st.markdown(f"**Câu {sid + 1}.** {s['text']}")
+        st.markdown(f"**Câu {sid + 1}.**")
+        m = s.get("map")
+        if m and m.get("chunks"):
+            st.markdown(render_map_full(m) if mode == "Đầy đủ" else render_map_basic(m))
+            if mode == "Đầy đủ":
+                cs = render_connected_speech(m)
+                if cs:
+                    st.caption(cs)
+            if m.get("tip_vi"):
+                st.caption("💡 " + m["tip_vi"])
+        else:
+            st.markdown(s["text"])
         st.caption(f"⏱ {s['start']}s → {s['end']}s")
+
         c1, c2 = st.columns([1, 1])
         with c1:
             if st.button("▶️ Nghe mẫu", key=f"play_{sid}"):
-                youtube_clip_component(vid, s["start"], s["end"], key=f"{sid}")
+                st.session_state[f"show_{sid}"] = True
         with c2:
             from audiorecorder import audiorecorder
             audio = audiorecorder("🔴 Thu âm", "⏹ Dừng", key=f"rec_{sid}")
-            if len(audio) > 0:
-                wav = audiosegment_to_wav_bytes(audio)
-                st.audio(wav, format="audio/wav")
-                if st.button("📤 Nộp bài", key=f"submit_{sid}", type="primary"):
-                    _handle_submit(stu, lesson, s, wav)
+
+        if st.session_state.get(f"show_{sid}"):
+            youtube_clip_component(vid, s["start"], s["end"], key=f"{sid}")
+
+        if len(audio) > 0:
+            wav = audiosegment_to_wav_bytes(audio)
+            st.audio(wav, format="audio/wav")
+            if st.button("📤 Nộp bài", key=f"submit_{sid}", type="primary"):
+                _handle_submit(stu, lesson, s, wav)
 
 
 def _handle_submit(stu, lesson, sentence, wav):
@@ -515,6 +717,14 @@ def _handle_submit(stu, lesson, sentence, wav):
     color = "green" if score >= 75 else ("orange" if score >= 50 else "red")
     st.markdown(f"### Điểm: :{color}[{score}/100]")
     st.write(result["feedback"])
+
+    issues = result.get("issues") or []
+    if issues:
+        issue_words = [i.get("word", "") for i in issues]
+        st.markdown("**Chỗ cần sửa:** " + highlight_issue_words(sentence["text"], issue_words))
+        for i in issues:
+            st.caption(f"• **{i.get('word','')}** — {i.get('problem_vi','')}")
+
     badges = []
     if info["new_best"]:
         badges.append("🏆 Kỷ lục cao mới!")
@@ -557,16 +767,38 @@ def teacher_compose():
         st.success(f"Gom được {len(preview)} câu:")
         st.dataframe(pd.DataFrame(preview)[["sentence_id", "start", "end", "text"]],
                      use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### 🗺️ Bản đồ phát âm (tùy chọn)")
+        st.markdown(
+            "1. Bấm **Copy** khối dưới → dán vào ChatGPT / Claude / Gemini.\n"
+            "2. Nó trả về JSON → **dán ngược** vào ô bên dưới.\n"
+            "3. Bấm Lưu. *(Bỏ trống cũng được — câu sẽ hiện trơn, không có bản đồ.)*"
+        )
+        with st.expander("📋 Khối để copy (prompt + danh sách câu)"):
+            st.code(build_teacher_prompt(preview), language="text")
+
+        map_json = st.text_area("Dán JSON bản đồ AI trả về vào đây", height=160,
+                                key="map_json")
+
         if st.button("💾 Lưu bài học", type="primary"):
             if not (title and yt and preview):
                 st.error("Thiếu tên bài / link / transcript.")
             else:
+                sentences, n = attach_maps(preview, map_json)
+                if n == -1:
+                    st.warning("JSON bản đồ lỗi định dạng → lưu bài KHÔNG kèm bản đồ. "
+                               "Kiểm tra lại JSON nếu muốn có bản đồ.")
+                    sentences, n = preview, 0
                 sb.table("assistantapp_shadowing_lessons").insert({
                     "assignment_id": assignment_id, "title": title,
-                    "youtube_link": yt, "sentences": preview,
+                    "youtube_link": yt, "sentences": sentences,
                 }).execute()
                 st.session_state.preview = None
-                st.success("Đã lưu bài học!")
+                msg = f"Đã lưu bài học! Gắn bản đồ cho {n}/{len(sentences)} câu."
+                if n < len(sentences):
+                    msg += " (Câu thiếu bản đồ sẽ hiện trơn.)"
+                st.success(msg)
 
 
 def teacher_stats():
