@@ -358,9 +358,14 @@ GEMINI_PROMPT = """Bạn là giám khảo IELTS chấm phát âm.
    (đọc phẳng, không nhấn trọng âm, sai âm). Mỗi cái:
    {"word": "<từ trong câu gốc>", "problem_vi": "<lỗi ngắn gọn tiếng Việt>"}.
    Nếu đọc tốt thì để [].
-4. CHỈ trả về JSON, không thêm chữ nào khác:
+4. stress_check: chọn 4–6 TỪ chính trong câu (gồm từ ĐÁNG nhấn + vài từ đọc lướt cạnh nó).
+   Với mỗi từ, chấm ĐỘ NỔI mà HỌC SINH THỰC SỰ đọc (to & dài = nổi): level 0-100.
+   Từ đáng nhấn mà học sinh đọc lướt/ngắn → level THẤP. Dạng
+   [{"word":"greet","level":45},{"word":"each","level":40},{"word":"other","level":35}].
+5. CHỈ trả về JSON, không thêm chữ nào khác:
 {"is_cheating": boolean, "score": number (0-100), "feedback": "lời khuyên ngắn tiếng Việt",
-"issues": [{"word": "...", "problem_vi": "..."}]}
+"issues": [{"word": "...", "problem_vi": "..."}],
+"stress_check": [{"word": "...", "level": number}]}
 
 Câu gốc học sinh cần đọc: "%s"
 """
@@ -394,6 +399,7 @@ def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
             data["is_cheating"] = bool(data.get("is_cheating", False))
             data["feedback"] = str(data.get("feedback", ""))
             data["issues"] = [i for i in (data.get("issues") or []) if isinstance(i, dict)]
+            data["stress_check"] = [x for x in (data.get("stress_check") or []) if isinstance(x, dict)]
             st.session_state.gemini_model = name          # nhớ model chạy được
             return data
         except Exception as e:
@@ -783,6 +789,10 @@ Với MỖI câu, trả về "bản đồ phát âm":
      from, was, are, that...): ghi dạng CÒN LẠI để học sinh tự nghe chọn.
      VD can: ipa "kən" (weak) + ipa_alt "kæn" (strong); at: "ət" + "æt"; to: "tə" + "tuː".
    - Từ nội dung (danh/động/tính...) chỉ cần ipa, ĐỂ ipa_alt = "".
+6. model_stress: chấm ĐỘ NỔI của CHÍNH NGƯỜI NÓI trong audio cho 4–6 TỪ chính
+   (gồm từ đáng nhấn + vài từ đọc lướt cạnh nó), level 0-100 (to & dài = nổi).
+   Đây là "chuẩn" để học sinh so sánh. Dạng
+   [{"word":"greet","level":85},{"word":"each","level":35},{"word":"other","level":30}].
 
 Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
 CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
@@ -818,6 +828,7 @@ def attach_maps(sentences: list[dict], json_text: str):
                 "connected_speech": item.get("connected_speech", []),
                 "tip_vi": item.get("tip_vi", ""),
                 "words": item.get("words", []),
+                "model_stress": item.get("model_stress", []),
             }
     n = 0
     for s in sentences:
@@ -1011,10 +1022,40 @@ def _handle_grade(stu, lesson, sentence, take):
     st.caption(f"Đã chấm câu này: {info['total']} lần · Hôm nay: {info['today']}/{CAP_PER_DAY}")
 
     rms, verdict, _flat = energy_curve(take["wav"])
-    if rms:
-        st.markdown("**🌊 Nhịp giọng của em (độ vang theo thời gian):**")
-        st.area_chart(rms, height=140)
-        st.caption("Đỉnh cao/rộng = âm được nhấn & kéo dài · phẳng lì = đọc đều. " + verdict)
+    stu_sc = result.get("stress_check") or []
+    model_sc = (sentence.get("map") or {}).get("model_stress") or []
+
+    def _lvl(x):
+        try:
+            return max(0.0, min(100.0, float(x.get("level", 0))))
+        except Exception:
+            return 0.0
+
+    if model_sc:
+        stu_map = {_norm_word(x.get("word", "")): _lvl(x) for x in stu_sc}
+        seen, idx, mvals, svals = {}, [], [], []
+        for x in model_sc:
+            w = (str(x.get("word", "")).strip() or "?")
+            seen[w] = seen.get(w, 0) + 1
+            idx.append(w if seen[w] == 1 else f"{w} ({seen[w]})")
+            mvals.append(_lvl(x))
+            svals.append(stu_map.get(_norm_word(w), 0.0))
+        st.markdown("**🎯 Độ nổi từng từ — Mẫu vs Em:**")
+        st.bar_chart(pd.DataFrame({"Mẫu": mvals, "Em": svals}, index=idx))
+        st.caption("Chỗ cột **Mẫu** cao (từ được nhấn) thì cột **Em** cũng phải cao theo. "
+                   + (verdict or ""))
+    elif stu_sc:
+        seen, idx, vals = {}, [], []
+        for x in stu_sc:
+            w = (str(x.get("word", "")).strip() or "?")
+            seen[w] = seen.get(w, 0) + 1
+            idx.append(w if seen[w] == 1 else f"{w} ({seen[w]})")
+            vals.append(_lvl(x))
+        st.markdown("**🎯 Độ nổi từng từ (em vừa đọc):**")
+        st.bar_chart(pd.DataFrame({"độ nổi": vals}, index=idx))
+        st.caption("Cột cao = đọc TO & DÀI. Từ trọng âm phải cao hơn từ lướt. " + (verdict or ""))
+    elif verdict:
+        st.caption("🌊 " + verdict)
 
 
 # ---------------------------------------------------------------------------
