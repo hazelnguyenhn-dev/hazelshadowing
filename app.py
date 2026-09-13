@@ -614,6 +614,58 @@ def _cs_item(c: dict) -> str:
     return f"{tie} ({tag})"           # nối/chèn/gộp: dấu ‿ (+ IPA nếu có)
 
 
+def _word_stack_html(word: str, stress: list[str], fnorm: str, ipa_map: dict) -> str:
+    core, trail = word, ""
+    mm = re.search(r"[.,!?;:]+$", word)
+    if mm:
+        core, trail = word[:mm.start()], word[mm.start():]
+    key = _norm_word(core)
+
+    if fnorm and key == fnorm:
+        top = f'<span style="color:#d62728;font-weight:700">{core}</span>'
+    else:
+        frag = None
+        for f in (stress or []):
+            f = (f or "").strip()
+            if not f:
+                continue
+            if (len(f) >= 3 and re.search(re.escape(f), core, flags=re.I)) or \
+               (len(f) < 3 and core.lower().startswith(f.lower())):
+                frag = f
+                break
+        if frag:
+            r = re.search(re.escape(frag), core, flags=re.I)
+            top = core[:r.start()] + "<b>" + core[r.start():r.end()] + "</b>" + core[r.end():]
+        else:
+            top = core
+
+    ipa = ipa_map.get(key, "")
+    bottom = (f'<span style="display:block;font-size:0.72em;color:#e07b39;line-height:1.1">/{ipa}/</span>'
+              if ipa else '<span style="display:block;font-size:0.72em;line-height:1.1">&nbsp;</span>')
+    return (f'<span style="display:inline-block;text-align:center;margin:0 3px;'
+            f'vertical-align:top">{top}{trail}{bottom}</span>')
+
+
+def render_map_html(m: dict, full: bool) -> str:
+    ipa_map = {}
+    for w in (m.get("words") or []):
+        k = _norm_word(w.get("w", ""))
+        if k:
+            ipa_map[k] = (w.get("ipa", "") or "").strip("/")
+    fnorm = _norm_word(m.get("focus")) if m.get("focus") else None
+
+    segs = []
+    for c in m.get("chunks", []):
+        words = " ".join(_word_stack_html(w, c.get("stress", []), fnorm, ipa_map)
+                         for w in (c.get("text", "") or "").split())
+        if full:
+            arrow = TONE_ARROW.get(c.get("tone", ""), "")
+            words += f' <span style="vertical-align:top">{arrow}</span>'
+        segs.append(words)
+    sep = '  <span style="color:#bbb;vertical-align:top">|</span>  ' if full else " "
+    return f'<div style="line-height:1.4">{sep.join(segs)}</div>'
+
+
 def render_connected_speech(m: dict) -> str:
     cs = m.get("connected_speech") or []
     if not cs:
@@ -764,19 +816,16 @@ def student_app():
         st.markdown(f"**Câu {sid + 1}.**")
         m = s.get("map")
         if m and m.get("chunks"):
-            st.markdown(render_map_full(m) if mode == "Đầy đủ" else render_map_basic(m))
+            if m.get("words"):
+                st.markdown(render_map_html(m, mode == "Đầy đủ"), unsafe_allow_html=True)
+            else:
+                st.markdown(render_map_full(m) if mode == "Đầy đủ" else render_map_basic(m))
             if mode == "Đầy đủ":
                 cs = render_connected_speech(m)
                 if cs:
                     st.caption(cs)
             if m.get("tip_vi"):
                 st.caption("💡 " + m["tip_vi"])
-            words = m.get("words") or []
-            if words:
-                with st.expander("🔤 Phiên âm từng từ"):
-                    for w in words:
-                        ipa = (w.get("ipa", "") or "").strip("/")
-                        st.markdown(f"**{w.get('w','')}**  /{ipa}/")
         else:
             st.markdown(s["text"])
         st.caption(f"⏱ {s['start']}s → {s['end']}s")
