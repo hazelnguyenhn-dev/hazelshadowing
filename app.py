@@ -19,7 +19,7 @@ import io
 import re
 import json
 import difflib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 import streamlit as st
 import pandas as pd
@@ -38,7 +38,9 @@ GEMINI_MODEL_CANDIDATES = [
     "gemini-2.5-flash-lite",
     "gemini-1.5-flash",
 ]
-LAYER1_MIN_RATIO = 0.35
+LAYER1_MIN_RATIO = 0.50        # đọc đúng nội dung tối thiểu 50%
+MIN_DURATION_RATIO = 0.60      # bản ghi phải dài ≥ 60% đoạn mẫu
+CAP_PER_DAY = 5                # tối đa số lần CHẤM mỗi câu / ngày
 DEFAULT_TAIL_SEC = 5.0
 
 
@@ -410,8 +412,18 @@ def upload_audio(student_id, lesson_id, sentence_id, kind, wav_bytes) -> str:
     return public_url(path)
 
 
-def save_attempt(student_id, lesson_id, sentence_id, score, wav_bytes) -> dict:
+def scored_today(rec) -> int:
+    """Số lần đã chấm HÔM NAY cho câu này (0 nếu chưa có / khác ngày)."""
+    if not rec:
+        return 0
+    if rec.get("daily_date") == date.today().isoformat():
+        return rec.get("daily_count") or 0
+    return 0
+
+
+def save_attempt(student_id, lesson_id, sentence_id, score, wav_bytes, feedback) -> dict:
     now = datetime.now(timezone.utc).isoformat()
+    today = date.today().isoformat()
     rec = get_record(student_id, lesson_id, sentence_id)
 
     if rec is None:
@@ -420,22 +432,29 @@ def save_attempt(student_id, lesson_id, sentence_id, score, wav_bytes) -> dict:
         sb.table("assistantapp_shadowing_records").insert({
             "student_id": student_id, "lesson_id": lesson_id, "sentence_id": sentence_id,
             "total_attempts": 1, "best_score": score, "worst_score": score,
-            "best_audio_url": best_url, "worst_audio_url": worst_url, "last_updated": now,
+            "best_audio_url": best_url, "worst_audio_url": worst_url,
+            "best_feedback": feedback, "worst_feedback": feedback,
+            "daily_count": 1, "daily_date": today, "last_updated": now,
         }).execute()
-        return {"new_best": True, "new_worst": True, "total": 1}
+        return {"new_best": True, "new_worst": True, "total": 1, "today": 1}
 
-    upd = {"total_attempts": rec["total_attempts"] + 1, "last_updated": now}
+    new_daily = (rec.get("daily_count") or 0) + 1 if rec.get("daily_date") == today else 1
+    upd = {"total_attempts": rec["total_attempts"] + 1, "last_updated": now,
+           "daily_count": new_daily, "daily_date": today}
     new_best = new_worst = False
     if rec["best_score"] is None or score > rec["best_score"]:
         upd["best_score"] = score
         upd["best_audio_url"] = upload_audio(student_id, lesson_id, sentence_id, "best", wav_bytes)
+        upd["best_feedback"] = feedback
         new_best = True
     if rec["worst_score"] is None or score < rec["worst_score"]:
         upd["worst_score"] = score
         upd["worst_audio_url"] = upload_audio(student_id, lesson_id, sentence_id, "worst", wav_bytes)
+        upd["worst_feedback"] = feedback
         new_worst = True
     sb.table("assistantapp_shadowing_records").update(upd).eq("id", rec["id"]).execute()
-    return {"new_best": new_best, "new_worst": new_worst, "total": upd["total_attempts"]}
+    return {"new_best": new_best, "new_worst": new_worst,
+            "total": upd["total_attempts"], "today": new_daily}
 
 
 # ---------------------------------------------------------------------------
@@ -709,20 +728,42 @@ def student_app():
 
         if len(audio) > 0:
             wav = audiosegment_to_wav_bytes(audio)
+            rec_seconds = len(audio) / 1000.0
             st.audio(wav, format="audio/wav")
-            if st.button("📤 Nộp bài", key=f"submit_{sid}", type="primary"):
-                _handle_submit(stu, lesson, s, wav)
+            st.caption("Chưa ưng? Bấm 🔴 Thu âm lần nữa để thu lại (không tốn lượt). "
+                       "Ưng rồi mới bấm Chấm.")
+            if st.button("✅ Chấm bản này", key=f"submit_{sid}", type="primary"):
+                _handle_submit(stu, lesson, s, wav, rec_seconds)
 
 
-def _handle_submit(stu, lesson, sentence, wav):
+def _handle_submit(stu, lesson, sentence, wav, rec_seconds):
     sid = sentence["sentence_id"]
+    sample_len = float(sentence["end"]) - float(sentence["start"])
+    need = max(1.0, MIN_DURATION_RATIO * sample_len)
+
+    # Cửa 1 (miễn phí): đủ dài chưa?
+    if rec_seconds < need:
+        st.error(f"❌ Bản ghi quá ngắn ({rec_seconds:.1f}s, cần ≥ {need:.1f}s). "
+                 "Đọc trọn cả câu rồi hãy chấm — KHÔNG tính lượt.")
+        return
+
+    # Cửa 2 (miễn phí): đọc đúng nội dung chưa?
     with st.spinner("Đang kiểm tra nhanh..."):
         ok1, ratio, heard = layer1_check(wav, sentence["text"])
     if not ok1:
-        st.error(f"❌ Đọc linh tinh / sai nội dung (khớp {ratio:.0%}). "
+        st.error(f"❌ Đọc sai nội dung / nói linh tinh (khớp {ratio:.0%}). "
                  f"KHÔNG tính lượt. (Máy nghe được: “{heard or 'không rõ'}”)")
         return
 
+    # Cửa 3 (miễn phí): còn lượt chấm hôm nay không?
+    rec = get_record(stu["id"], lesson["id"], sid)
+    if scored_today(rec) >= CAP_PER_DAY:
+        st.warning(f"⏳ Câu này đã chấm đủ {CAP_PER_DAY} lần hôm nay. "
+                   "Cứ luyện thêm (nghe mẫu, thu lại) và quay lại ngày mai nhé — "
+                   "để dành lượt API.")
+        return
+
+    # Cửa 4 (tốn API): chấm + chống giọng máy
     try:
         with st.spinner("Đang chấm ngữ điệu bằng AI..."):
             result = score_rotating(st.session_state.gemini_keys, wav, sentence["text"])
@@ -735,10 +776,11 @@ def _handle_submit(stu, lesson, sentence, wav):
         return
 
     if result["is_cheating"]:
-        st.error("🚨 Phát hiện gian lận dùng AI đọc hộ, hủy bài!")
+        st.error("🚨 Phát hiện gian lận dùng AI/máy đọc hộ — hủy bài, KHÔNG tính lượt!")
         return
 
-    info = save_attempt(stu["id"], lesson["id"], sid, result["score"], wav)
+    # Hợp lệ -> +1 attempt, cập nhật best/worst kèm nhận xét
+    info = save_attempt(stu["id"], lesson["id"], sid, result["score"], wav, result["feedback"])
     score = result["score"]
     color = "green" if score >= 75 else ("orange" if score >= 50 else "red")
     st.markdown(f"### Điểm: :{color}[{score}/100]")
@@ -758,7 +800,8 @@ def _handle_submit(stu, lesson, sentence, wav):
         badges.append("📉 Điểm thấp mới (đã lưu để đối chiếu)")
     if badges:
         st.info(" · ".join(badges))
-    st.caption(f"Tổng số lần luyện câu này: {info['total']}")
+    st.caption(f"Tổng lần chấm hợp lệ câu này: {info['total']} · "
+               f"Hôm nay: {info['today']}/{CAP_PER_DAY}")
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +870,22 @@ def teacher_compose():
                 st.success(msg)
 
 
+def humanize_since(iso: str) -> str:
+    if not iso:
+        return "—"
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - t
+        s = int(delta.total_seconds())
+        if s < 3600:
+            return f"{max(1, s // 60)} phút trước"
+        if s < 86400:
+            return f"{s // 3600} giờ trước"
+        return f"{s // 86400} ngày trước"
+    except Exception:
+        return iso[:10]
+
+
 def teacher_stats():
     st.subheader("📊 Thống kê tiến độ")
     recs = sb.table("assistantapp_shadowing_records").select("*").execute().data or []
@@ -846,29 +905,35 @@ def teacher_stats():
                          or students.get(r["student_id"], {}).get("nick_name") or r["student_id"]),
             "Bài": lessons.get(r["lesson_id"], {}).get("title", r["lesson_id"]),
             "Câu": r["sentence_id"] + 1,
-            "Số lần": r["total_attempts"],
+            "Số lần chấm": r["total_attempts"],
             "Cao nhất": r["best_score"],
             "Thấp nhất": r["worst_score"],
+            "Lần gần nhất": humanize_since(r.get("last_updated")),
             "best_url": r["best_audio_url"],
             "worst_url": r["worst_audio_url"],
-            "Cập nhật": r["last_updated"],
+            "best_fb": r.get("best_feedback") or "",
+            "worst_fb": r.get("worst_feedback") or "",
         })
     df = pd.DataFrame(rows).sort_values(["Học sinh", "Bài", "Câu"]).reset_index(drop=True)
-    st.dataframe(df.drop(columns=["best_url", "worst_url"]),
+    st.dataframe(df.drop(columns=["best_url", "worst_url", "best_fb", "worst_fb"]),
                  use_container_width=True, hide_index=True)
 
-    st.markdown("#### 🔊 Nghe audio Tốt nhất / Tệ nhất")
-    who = st.selectbox("Chọn dòng để nghe", df.index,
+    st.markdown("#### 🔊 Nghe + xem AI chấm (Tốt nhất / Tệ nhất)")
+    who = st.selectbox("Chọn dòng", df.index,
                        format_func=lambda i: f"{df.loc[i,'Học sinh']} · {df.loc[i,'Bài']} · Câu {df.loc[i,'Câu']}")
     a, b = st.columns(2)
     with a:
-        st.caption(f"🏆 Tốt nhất ({df.loc[who,'Cao nhất']})")
+        st.markdown(f"🏆 **Tốt nhất — {df.loc[who,'Cao nhất']}/100**")
         if df.loc[who, "best_url"]:
             st.audio(df.loc[who, "best_url"])
+        if df.loc[who, "best_fb"]:
+            st.caption(df.loc[who, "best_fb"])
     with b:
-        st.caption(f"📉 Tệ nhất ({df.loc[who,'Thấp nhất']})")
+        st.markdown(f"📉 **Tệ nhất — {df.loc[who,'Thấp nhất']}/100**")
         if df.loc[who, "worst_url"]:
             st.audio(df.loc[who, "worst_url"])
+        if df.loc[who, "worst_fb"]:
+            st.caption(df.loc[who, "worst_fb"])
 
 
 def teacher_dashboard():
