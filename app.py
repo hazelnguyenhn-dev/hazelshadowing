@@ -541,7 +541,7 @@ def youtube_clip_component(video_id: str, start: float, end: float, key: str):
 # ---------------------------------------------------------------------------
 TONE_ARROW = {"level": "→", "rise": "↗", "fall": "↘", "fall-rise": "↘↗"}
 CS_LABEL = {"linking": "nối âm", "elision": "nuốt âm", "assimilation": "đổi âm",
-            "intrusion": "chèn âm", "gemination": "gộp âm"}
+            "intrusion": "chèn âm", "gemination": "gộp âm", "flap": "âm vỗ t→d"}
 
 
 def _norm_word(w: str) -> str:
@@ -593,13 +593,22 @@ def render_map_full(m: dict) -> str:
     return "  |  ".join(segs)
 
 
+def _cs_item(c: dict) -> str:
+    typ = c.get("type", "")
+    tie = (c.get("span", "") or "").replace(" ", "‿")
+    label = CS_LABEL.get(typ, typ)
+    ipa = (c.get("ipa", "") or "").strip().strip("/")
+    tag = f"{label} /{ipa}/" if ipa else label
+    if typ in ("elision", "flap", "assimilation") and c.get("sounds_like"):
+        return f'{tie} → *{c["sounds_like"]}* ({tag})'
+    return f"{tie} ({tag})"           # nối/chèn/gộp: dấu ‿ (+ IPA nếu có)
+
+
 def render_connected_speech(m: dict) -> str:
     cs = m.get("connected_speech") or []
     if not cs:
         return ""
-    items = [f'{c.get("span","")} → *{c.get("sounds_like","")}* '
-             f'({CS_LABEL.get(c.get("type",""), c.get("type",""))})' for c in cs]
-    return "🔗 " + "  ·  ".join(items)
+    return "🔗 " + "  ·  ".join(_cs_item(c) for c in cs)
 
 
 def highlight_issue_words(text: str, words: list[str]) -> str:
@@ -629,13 +638,23 @@ DỰA TRÊN AUDIO — không suy đoán theo lý thuyết sách vở.
 Với MỖI câu, trả về "bản đồ phát âm":
 1. chunks: chia câu theo NHÓM THỞ mà người nói NGẮT thực tế trong audio. Mỗi chunk gồm:
    - text: nguyên văn phần chunk (giữ dấu câu).
-   - stress: các ÂM TIẾT mà người nói NHẤN RÕ trong đoạn đó (vd "por" cho "important",
-     "bought" cho từ một âm tiết).
+   - stress: chỉ đánh dấu NHỊP MẠNH THẬT SỰ nghe được (thường 1–2 nhịp mỗi chunk).
+     Từ chức năng (a/the/of/to/and/is...) và từ đọc lướt thì BỎ QUA, đừng nhấn tràn lan.
+     Cụm cố định đọc liền (vd "Asian countries", "each other") coi như 1 đơn vị,
+     chỉ nhấn 1 trọng âm chính của cụm (vd "A" trong "Asian countries").
    - tone: hướng giọng CUỐI chunk NGHE ĐƯỢC trong audio, chọn đúng 1:
        "level" = giữ ngang, "rise" = lên, "fall" = xuống, "fall-rise" = xuống-lên.
 2. focus: từ mà người nói NHẤN MẠNH NHẤT trong câu (nghe rõ nhất).
-3. connected_speech: chỗ NGHE THẤY nối/nuốt âm, mỗi cái {type, span, sounds_like, note_vi}.
-   type ∈ linking, elision, assimilation, intrusion, gemination. Không rõ thì để [].
+3. connected_speech: chỗ nối/nuốt/biến âm NGHE THẤY. Mỗi cái {type, span, sounds_like, note_vi}.
+   type ∈ linking, intrusion, gemination, elision, assimilation, flap.
+   - NỐI ÂM thường (phụ âm cuối → nguyên âm đầu), chèn âm, gộp âm: CHỈ ghi span,
+     ĐỂ sounds_like = "" — app tự nối bằng dấu ‿ (vd "greet each" → greet‿each,
+     "laugh at" → laugh‿at). TUYỆT ĐỐI đừng viết lại kiểu phiên âm.
+   - CHỈ điền sounds_like khi ÂM THẬT SỰ đổi/mất:
+       flap: /t/ /d/ giữa 2 nguyên âm nghe thành /d/ (vd "get it" → "ge-dit", "water" → "wa-der").
+       elision: có âm bị nuốt (vd "next door" → "nex door").
+   - Không rõ thì để [].
+   - ipa (TÙY CHỌN): phiên âm IPA của chỗ nối, vd "ɡriːt‿iːtʃ". Không chắc thì bỏ "".
 4. tip_vi: 1 câu tiếng Việt NGẮN — điểm quan trọng nhất khi nhại theo audio này.
 
 Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
