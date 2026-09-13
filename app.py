@@ -93,6 +93,38 @@ def audiosegment_to_wav_bytes(seg) -> bytes:
     return buf.getvalue()
 
 
+def energy_curve(wav_bytes: bytes):
+    """Đường độ vang (RMS) theo thời gian + nhận xét đều/nhấn. Chỉ dùng numpy."""
+    import wave
+    import numpy as np
+    try:
+        wf = wave.open(io.BytesIO(wav_bytes), "rb")
+        n, sr, ch, sw = wf.getnframes(), wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+        data = np.frombuffer(wf.readframes(n),
+                             dtype={1: np.int8, 2: np.int16, 4: np.int32}.get(sw, np.int16)
+                             ).astype(np.float32)
+        if ch > 1:
+            data = data.reshape(-1, ch).mean(axis=1)
+    except Exception:
+        return None, "", False
+    win = max(1, int(sr * 0.03))                     # cửa sổ 30ms
+    nw = data.size // win
+    if nw < 3:
+        return None, "", False
+    rms = np.sqrt((data[:nw * win].reshape(nw, win) ** 2).mean(axis=1))
+    rms = rms / (rms.max() + 1e-9)                    # chuẩn hoá 0..1
+    voiced = rms[rms > 0.15]                          # bỏ khoảng lặng
+    contrast = (float(np.percentile(voiced, 90) / (np.percentile(voiced, 50) + 1e-9))
+                if voiced.size >= 3 else 0.0)
+    flat = contrast < 1.6
+    if flat:
+        verdict = ("📏 Giọng khá ĐỀU ĐỀU — các âm to gần bằng nhau, chưa nhấn nhá rõ. "
+                   "Thử đọc TO & DÀI hơn ở âm tiết trọng âm, các âm còn lại đọc lướt nhẹ.")
+    else:
+        verdict = "👍 Có nhấn nhá — âm trọng âm nổi hơn âm lướt. Giữ nhịp này nhé!"
+    return rms.tolist(), verdict, flat
+
+
 GEMINI_KEY_URL = "https://aistudio.google.com/app/apikey"
 
 
@@ -459,6 +491,21 @@ def save_attempt(student_id, lesson_id, sentence_id, score, wav_bytes, feedback)
             "total": upd["total_attempts"], "today": new_daily}
 
 
+def record_listen(student_id, lesson_id, sentence_id):
+    """Đếm 1 lượt bấm Nghe mẫu / Nghe lại."""
+    now = datetime.now(timezone.utc).isoformat()
+    rec = get_record(student_id, lesson_id, sentence_id)
+    if rec is None:
+        sb.table("assistantapp_shadowing_records").insert({
+            "student_id": student_id, "lesson_id": lesson_id, "sentence_id": sentence_id,
+            "total_attempts": 0, "listen_count": 1, "last_updated": now,
+        }).execute()
+        return
+    sb.table("assistantapp_shadowing_records").update({
+        "listen_count": (rec.get("listen_count") or 0) + 1, "last_updated": now,
+    }).eq("id", rec["id"]).execute()
+
+
 def record_practice(student_id, lesson_id, sentence_id, seconds, match):
     """Ghi 1 lần LUYỆN hợp lệ (miễn phí, không chấm). Tăng practice_count + log."""
     now = datetime.now(timezone.utc).isoformat()
@@ -486,9 +533,6 @@ def youtube_clip_component(video_id: str, start: float, end: float, key: str):
     html = f"""
     <div id="player_{key}"></div>
     <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-      <button id="replay_{key}" style="padding:8px 14px; border-radius:8px;
-        border:1px solid #ccc; background:#f6f6f6; cursor:pointer; font-size:15px;">
-        🔁 Nghe lại đoạn</button>
       <label style="font-size:14px; cursor:pointer;">
         <input type="checkbox" id="loop_{key}"> Lặp tự động</label>
       <span style="font-size:13px; color:#888;">({start}s → {end}s)</span>
@@ -519,7 +563,6 @@ def youtube_clip_component(video_id: str, start: float, end: float, key: str):
             }}
           }}
         }});
-        document.getElementById('replay_{key}').onclick = playSeg_{key};
         document.getElementById('loop_{key}').onchange = function(ev) {{
           seg_{key}.loop = ev.target.checked;
           if (seg_{key}.loop) playSeg_{key}();
@@ -639,14 +682,11 @@ def _word_stack_html(word: str, stress: list[str], fnorm: str, ipa_map: dict) ->
         else:
             top = core
 
-    ipa, alt = ipa_map.get(key, ("", ""))
-    if ipa and alt:
-        label = f"/{ipa}/ · /{alt}/"
-    elif ipa:
-        label = f"/{ipa}/"
+    ipa, _alt = ipa_map.get(key, ("", ""))
+    if ipa:
+        label, color = f"/{ipa}/", "color:#e07b39;"
     else:
-        label = "&nbsp;"
-    color = "color:#e07b39;" if ipa else ""
+        label, color = "&nbsp;", ""
     bottom = f'<span style="display:block;font-size:0.72em;{color}line-height:1.1">{label}</span>'
     return (f'<span style="display:inline-block;text-align:center;margin:0 3px;'
             f'vertical-align:top">{top}{trail}{bottom}</span>')
@@ -833,8 +873,14 @@ def student_app():
         if m and m.get("chunks"):
             if m.get("words"):
                 st.markdown(render_map_html(m, mode == "Đầy đủ"), unsafe_allow_html=True)
-                if any((w.get("ipa_alt") or "").strip() for w in m["words"]):
-                    st.caption("Từ có 2 phiên âm (/weak/ · /strong/): tự nghe clip để chọn dạng đúng.")
+                strong = [(w.get("w", ""), (w.get("ipa_alt", "") or "").strip("/"))
+                          for w in m["words"] if (w.get("ipa_alt") or "").strip()]
+                if strong:
+                    with st.expander("🔊 Dạng nhấn mạnh (strong) — bấm xem"):
+                        st.caption("Phiên âm hiện dưới từ là dạng đọc lướt (weak). "
+                                   "Khi từ được nhấn mạnh thì đọc dạng strong:")
+                        for wname, alt in strong:
+                            st.markdown(f"**{wname}** /{alt}/")
             else:
                 st.markdown(render_map_full(m) if mode == "Đầy đủ" else render_map_basic(m))
             if mode == "Đầy đủ":
@@ -851,12 +897,19 @@ def student_app():
         with c1:
             if st.button("▶️ Nghe mẫu", key=f"play_{sid}"):
                 st.session_state[f"show_{sid}"] = True
+                st.session_state[f"nonce_{sid}"] = st.session_state.get(f"nonce_{sid}", 0) + 1
+                record_listen(stu["id"], lesson["id"], sid)
         with c2:
             from audiorecorder import audiorecorder
             audio = audiorecorder("🔴 Thu âm", "⏹ Dừng", key=f"rec_{sid}")
 
         if st.session_state.get(f"show_{sid}"):
-            youtube_clip_component(vid, s["start"], s["end"], key=f"{sid}")
+            nonce = st.session_state.get(f"nonce_{sid}", 0)
+            youtube_clip_component(vid, s["start"], s["end"], key=f"{sid}_{nonce}")
+            if st.button("🔁 Nghe lại", key=f"replay_{sid}"):
+                st.session_state[f"nonce_{sid}"] = nonce + 1
+                record_listen(stu["id"], lesson["id"], sid)
+                st.rerun()
 
         takes_key = f"takes_{sid}"
         takes = st.session_state.setdefault(takes_key, [])
@@ -956,6 +1009,12 @@ def _handle_grade(stu, lesson, sentence, take):
     if badges:
         st.info(" · ".join(badges))
     st.caption(f"Đã chấm câu này: {info['total']} lần · Hôm nay: {info['today']}/{CAP_PER_DAY}")
+
+    rms, verdict, _flat = energy_curve(take["wav"])
+    if rms:
+        st.markdown("**🌊 Nhịp giọng của em (độ vang theo thời gian):**")
+        st.area_chart(rms, height=140)
+        st.caption("Đỉnh cao/rộng = âm được nhấn & kéo dài · phẳng lì = đọc đều. " + verdict)
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1119,7 @@ def teacher_stats():
                          or students.get(r["student_id"], {}).get("nick_name") or r["student_id"]),
             "Bài": lessons.get(r["lesson_id"], {}).get("title", r["lesson_id"]),
             "Câu": r["sentence_id"] + 1,
+            "Nghe": r.get("listen_count") or 0,
             "Luyện": r.get("practice_count") or 0,
             "Đã chấm": r["total_attempts"],
             "Cao nhất": r["best_score"],
