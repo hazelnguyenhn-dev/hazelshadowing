@@ -19,6 +19,7 @@ import io
 import re
 import json
 import difflib
+import hashlib
 from datetime import datetime, timezone, date
 
 import streamlit as st
@@ -620,36 +621,36 @@ def extract_json_array(text: str):
 
 
 TEACHER_MAP_PROMPT = """Bạn là chuyên gia phát âm tiếng Anh cho học sinh Việt Nam (A1–B1).
-Tôi đưa danh sách câu (mỗi dòng: ID | câu). Với MỖI câu, tạo "bản đồ phát âm".
+Tôi ĐÍNH KÈM một file audio (mp3) và danh sách câu, mỗi dòng: ID | start–end (giây) | câu.
+Hãy NGHE đúng đoạn từ start đến end của TỪNG câu, rồi mô tả CÁCH NGƯỜI NÓI TRONG AUDIO
+thực sự đọc (ngắt nhịp ở đâu, nhấn từ nào, cuối mỗi nhịp lên hay xuống giọng).
+DỰA TRÊN AUDIO — không suy đoán theo lý thuyết sách vở.
 
-QUY TẮC:
-1. chunks: chia câu thành các NHÓM THỞ (sense groups). Mỗi chunk gồm:
+Với MỖI câu, trả về "bản đồ phát âm":
+1. chunks: chia câu theo NHÓM THỞ mà người nói NGẮT thực tế trong audio. Mỗi chunk gồm:
    - text: nguyên văn phần chunk (giữ dấu câu).
-   - stress: các ÂM TIẾT mang trọng âm TỪ trong chunk (vd "por" cho "important",
-     "bought" cho từ một âm tiết). Chỉ nhấn từ nội dung (danh/động/tính/trạng từ,
-     từ để hỏi). KHÔNG nhấn a/the/to/of/is/and...
-   - tone: hướng giọng CUỐI chunk, chọn đúng 1:
-       "level" = giữ NGANG (dùng cho các món khi LIỆT KÊ giữa câu — KHÔNG dùng "rise"),
-       "rise"  = LÊN giọng (câu hỏi yes/no),
-       "fall"  = XUỐNG giọng (hết ý, câu kể, câu hỏi wh-),
-       "fall-rise" = xuống-lên (lửng lơ, chưa hết ý).
-2. focus: MỘT từ mang trọng âm CÂU (nhấn mạnh nhất), thường là từ nội dung cuối.
-3. connected_speech: hiện tượng nối/nuốt âm, mỗi cái {type, span, sounds_like, note_vi}.
-   type ∈ linking, elision, assimilation, intrusion, gemination.
-   CHỈ ghi cái RÕ RÀNG và thường gặp — ĐỪNG đánh dấu thừa. Không có thì để [].
-4. tip_vi: 1 câu tiếng Việt NGẮN, chỉ điểm quan trọng nhất.
+   - stress: các ÂM TIẾT mà người nói NHẤN RÕ trong đoạn đó (vd "por" cho "important",
+     "bought" cho từ một âm tiết).
+   - tone: hướng giọng CUỐI chunk NGHE ĐƯỢC trong audio, chọn đúng 1:
+       "level" = giữ ngang, "rise" = lên, "fall" = xuống, "fall-rise" = xuống-lên.
+2. focus: từ mà người nói NHẤN MẠNH NHẤT trong câu (nghe rõ nhất).
+3. connected_speech: chỗ NGHE THẤY nối/nuốt âm, mỗi cái {type, span, sounds_like, note_vi}.
+   type ∈ linking, elision, assimilation, intrusion, gemination. Không rõ thì để [].
+4. tip_vi: 1 câu tiếng Việt NGẮN — điểm quan trọng nhất khi nhại theo audio này.
 
+Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
 CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
 [{"sentence_id":0,"chunks":[{"text":"He bought","stress":["bought"],"tone":"level"},
-{"text":"apples,","stress":["ap"],"tone":"level"},{"text":"and oranges.","stress":["or"],"tone":"fall"}],
-"focus":"oranges","connected_speech":[],"tip_vi":"Liệt kê: giữ ngang, tới 'oranges' mới hạ giọng."}]
+{"text":"and oranges.","stress":["or"],"tone":"fall"}],
+"focus":"oranges","connected_speech":[],"tip_vi":"Nhại theo nhịp trong audio."}]
 
-DANH SÁCH CÂU:
+DANH SÁCH CÂU (ID | start–end giây | câu):
 """
 
 
 def build_teacher_prompt(sentences: list[dict]) -> str:
-    lines = [f'{s["sentence_id"]} | {s["text"]}' for s in sentences]
+    lines = [f'{s["sentence_id"]} | {s["start"]}–{s["end"]}s | {s["text"]}'
+             for s in sentences]
     return TEACHER_MAP_PROMPT + "\n".join(lines)
 
 
@@ -749,21 +750,21 @@ def student_app():
         takes = st.session_state.setdefault(takes_key, [])
         KEEP_VISIBLE = 5   # chỉ giữ vài bản gần nhất trên màn hình để chọn chấm
 
-        # Vừa thu xong 1 bản -> nghe thử + giữ lại
+        # Thu xong bản MỚI -> TỰ lưu (không cần bấm Giữ). Nhận diện bản mới bằng chữ ký.
         if len(audio) > 0:
             wav = audiosegment_to_wav_bytes(audio)
-            rec_seconds = len(audio) / 1000.0
-            st.audio(wav, format="audio/wav")
-            if st.button("💾 Giữ bản này", key=f"keep_{sid}"):
+            sig = hashlib.md5(wav).hexdigest()
+            if st.session_state.get(f"lastsig_{sid}") != sig:
+                st.session_state[f"lastsig_{sid}"] = sig
+                rec_seconds = len(audio) / 1000.0
                 ok, ratio, reason = free_gates(wav, rec_seconds, s)
-                if not ok:
-                    st.error(reason)
-                else:
+                if ok:
                     record_practice(stu["id"], lesson["id"], sid, rec_seconds, ratio)
                     takes.append({"wav": wav, "sec": rec_seconds, "match": ratio})
-                    del takes[:-KEEP_VISIBLE]     # chỉ hiển thị vài bản gần nhất
-                    st.success("✅ Luyện hợp lệ +1! (Đã tính vào tổng số lần thu.)")
-                    st.rerun()
+                    del takes[:-KEEP_VISIBLE]
+                    st.success("✅ Bản này hợp lệ — đã tự lưu, Luyện +1.")
+                else:
+                    st.error(reason + " (Thu lại nhé — bản này không được tính.)")
 
         # Danh sách bản gần đây -> chọn 1 bản để chấm
         if takes:
@@ -878,9 +879,10 @@ def teacher_compose():
         st.markdown("---")
         st.markdown("#### 🗺️ Bản đồ phát âm (tùy chọn)")
         st.markdown(
-            "1. Bấm **Copy** khối dưới → dán vào ChatGPT / Claude / Gemini.\n"
-            "2. Nó trả về JSON → **dán ngược** vào ô bên dưới.\n"
-            "3. Bấm Lưu. *(Bỏ trống cũng được — câu sẽ hiện trơn, không có bản đồ.)*"
+            "1. **Đính kèm file mp3** của bài vào ChatGPT / Gemini.\n"
+            "2. Bấm **Copy** khối dưới (đã có sẵn mốc giây từng câu) → dán vào cùng chỗ đó.\n"
+            "3. AI nghe từng đoạn → trả JSON → **dán ngược** vào ô bên dưới → bấm Lưu.\n"
+            "*(Bỏ trống cũng được — câu sẽ hiện trơn, không có bản đồ.)*"
         )
         with st.expander("📋 Khối để copy (prompt + danh sách câu)"):
             st.code(build_teacher_prompt(preview), language="text")
