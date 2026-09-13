@@ -564,6 +564,15 @@ def _bold_frag_in_word(word: str, frags: list[str]) -> str:
 
 def _render_chunk_words(chunk_text: str, stress: list[str], focus: str) -> str:
     fnorm = _norm_word(focus) if focus else None
+
+    def _applies(frag, word):
+        frag = (frag or "").strip()
+        if not frag:
+            return False
+        if len(frag) >= 3:
+            return re.search(re.escape(frag), word, flags=re.I) is not None
+        return word.lower().startswith(frag.lower())   # frag ngắn: chỉ khớp ĐẦU từ
+
     out = []
     for w in (chunk_text or "").split():
         core, trail = w, ""
@@ -573,7 +582,7 @@ def _render_chunk_words(chunk_text: str, stress: list[str], focus: str) -> str:
         if fnorm and _norm_word(core) == fnorm:
             disp = f":red[**{core}**]"                       # sentence stress
         else:
-            frags = [f for f in (stress or []) if re.search(re.escape(f), core, flags=re.I)]
+            frags = [f for f in (stress or []) if _applies(f, core)]
             disp = _bold_frag_in_word(core, frags) if frags else core
         out.append(disp + trail)
     return " ".join(out)
@@ -637,10 +646,10 @@ thực sự đọc (ngắt nhịp ở đâu, nhấn từ nào, cuối mỗi nh�
 DỰA TRÊN AUDIO — không suy đoán theo lý thuyết sách vở.
 
 Với MỖI câu, trả về "bản đồ phát âm":
-1. chunks: chia câu theo NHÓM NHỊP nhỏ (không phải cả hơi thở dài). Mỗi chunk là một
-   cụm đọc liền quanh 1 trọng âm chính. Đặc biệt: CỤM CỐ ĐỊNH / DANH NGỮ CHẶT
-   (vd "Asian countries", "each other", "common ground", "a good first impression")
-   tách thành 1 CHUNK RIÊNG để thấy rõ nó là 1 đơn vị. Mỗi chunk gồm:
+1. chunks: chia câu theo NHÓM THỞ / NHÓM Ý (sense group) — chỗ người nói THỰC SỰ ngắt
+   hơi hoặc ngữ điệu đổi. MỘT hơi thở là MỘT chunk, ĐỪNG cắt vụn
+   (vd "To make a good first impression," là 1 chunk, KHÔNG tách "To make" / "a good...").
+   Câu dài thường chỉ 2–4 chunk. Mỗi chunk gồm:
    - text: nguyên văn phần chunk (giữ dấu câu).
    - stress: chỉ đánh dấu NHỊP MẠNH THẬT SỰ nghe được (thường 1–2 nhịp mỗi chunk).
      Từ chức năng (a/the/of/to/and/is...) và từ đọc lướt thì BỎ QUA, đừng nhấn tràn lan.
@@ -660,6 +669,9 @@ Với MỖI câu, trả về "bản đồ phát âm":
    - Không rõ thì để [].
    - ipa (TÙY CHỌN): phiên âm IPA của chỗ nối, vd "ɡriːt‿iːtʃ". Không chắc thì bỏ "".
 4. tip_vi: 1 câu tiếng Việt NGẮN — điểm quan trọng nhất khi nhại theo audio này.
+5. words (TÙY CHỌN): phiên âm IPA từng TỪ NỘI DUNG chính, dạng
+   [{"w":"impression","ipa":"ɪmˈpreʃən"}, {"w":"greet","ipa":"ɡriːt"}].
+   Bỏ qua a/the/of/to/and... Không chắc thì để [].
 
 Nếu đoạn nào nghe không rõ, cứ dựa trên phần nghe được, ĐỪNG bịa.
 CHỈ trả về JSON array, không thêm chữ nào khác. Mẫu 1 phần tử:
@@ -694,6 +706,7 @@ def attach_maps(sentences: list[dict], json_text: str):
                 "focus": item.get("focus"),
                 "connected_speech": item.get("connected_speech", []),
                 "tip_vi": item.get("tip_vi", ""),
+                "words": item.get("words", []),
             }
     n = 0
     for s in sentences:
@@ -754,6 +767,12 @@ def student_app():
                     st.caption(cs)
             if m.get("tip_vi"):
                 st.caption("💡 " + m["tip_vi"])
+            words = m.get("words") or []
+            if words:
+                with st.expander("🔤 Phiên âm từng từ"):
+                    for w in words:
+                        ipa = (w.get("ipa", "") or "").strip("/")
+                        st.markdown(f"**{w.get('w','')}**  /{ipa}/")
         else:
             st.markdown(s["text"])
         st.caption(f"⏱ {s['start']}s → {s['end']}s")
