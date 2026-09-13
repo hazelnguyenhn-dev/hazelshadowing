@@ -31,7 +31,13 @@ from supabase import create_client, Client
 st.set_page_config(page_title="Shadowing Tiếng Anh", page_icon="🎤", layout="wide")
 
 AUDIO_BUCKET = "student_audios"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+]
 LAYER1_MIN_RATIO = 0.35
 DEFAULT_TAIL_SEC = 5.0
 
@@ -324,27 +330,47 @@ Câu gốc học sinh cần đọc: "%s"
 """
 
 
+def _list_models_str(genai) -> str:
+    try:
+        names = [m.name for m in genai.list_models()
+                 if "generateContent" in getattr(m, "supported_generation_methods", [])]
+        return ", ".join(names) if names else "(không có model nào hỗ trợ generateContent)"
+    except Exception as e:
+        return f"(không liệt kê được: {e})"
+
+
 def score_with_gemini(api_key: str, wav_bytes: bytes, target_text: str) -> dict:
     import google.generativeai as genai
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    try:
-        resp = model.generate_content([
-            GEMINI_PROMPT % target_text,
-            {"mime_type": "audio/wav", "data": wav_bytes},
-        ])
-        data = extract_json(resp.text)
-        data["score"] = int(round(float(data.get("score", 0))))
-        data["is_cheating"] = bool(data.get("is_cheating", False))
-        data["feedback"] = str(data.get("feedback", ""))
-        data["issues"] = [i for i in (data.get("issues") or []) if isinstance(i, dict)]
-        return data
-    except Exception as e:
-        msg = str(e).lower()
-        if any(k in msg for k in ("429", "quota", "resource", "exhaust",
-                                   "403", "permission", "api key", "api_key")):
-            raise ValueError("KEY_INVALID")
-        raise
+    prompt = GEMINI_PROMPT % target_text
+    audio = {"mime_type": "audio/wav", "data": wav_bytes}
+
+    cached = st.session_state.get("gemini_model")
+    candidates = ([cached] if cached else []) + \
+                 [m for m in GEMINI_MODEL_CANDIDATES if m != cached]
+
+    for name in candidates:
+        try:
+            model = genai.GenerativeModel(name)
+            resp = model.generate_content([prompt, audio])
+            data = extract_json(resp.text)
+            data["score"] = int(round(float(data.get("score", 0))))
+            data["is_cheating"] = bool(data.get("is_cheating", False))
+            data["feedback"] = str(data.get("feedback", ""))
+            data["issues"] = [i for i in (data.get("issues") or []) if isinstance(i, dict)]
+            st.session_state.gemini_model = name          # nhớ model chạy được
+            return data
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("429", "quota", "resource", "exhaust",
+                                       "403", "permission", "api key", "api_key")):
+                raise ValueError("KEY_INVALID")
+            if any(k in msg for k in ("404", "not found", "not supported")):
+                continue                                   # model này không có -> thử model kế
+            raise
+    # không model nào chạy được
+    raise RuntimeError("Không có model Gemini nào dùng được với key này. "
+                       "Model khả dụng: " + _list_models_str(genai))
 
 
 def score_rotating(keys: list[str], wav_bytes: bytes, target_text: str) -> dict:
